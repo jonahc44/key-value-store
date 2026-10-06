@@ -19,18 +19,18 @@ pub async fn serve(config: Config) -> std::io::Result<()> {
     } else {
         config.peers.len()
     };
-    eprintln!(
-        "key-value-store node {} listening on {addr} ({members} members)",
-        config.id
-    );
+    let node_id = config.id;
+    tracing::info!(node = node_id, %addr, members, "listening");
     let node = Node::start(config);
     let app = api::router(Arc::clone(&node));
     tokio::select! {
         result = axum::serve(listener, app) => {
             node.shutdown();
+            tracing::info!(node = node_id, "server stopped");
             result?;
         }
         _ = tokio::signal::ctrl_c() => {
+            tracing::info!(node = node_id, "shutting down");
             node.shutdown();
         }
     }

@@ -32,6 +32,7 @@ async fn append_entries(State(node): State<Arc<Node>>, Json(body): Json<Value>) 
     Json(node.handle_append_entries(&body).await)
 }
 
+#[tracing::instrument(skip_all, fields(node = node.id(), method = "GET", key = %key))]
 async fn get_key(
     State(node): State<Arc<Node>>,
     Path(key): Path<String>,
@@ -39,12 +40,19 @@ async fn get_key(
 ) -> Response {
     let forwarded = headers.contains_key("x-raft-forwarded");
     match node.read(key.clone()).await {
-        Ok(Some(value)) => (StatusCode::OK, Json(value)).into_response(),
-        Ok(None) => error(StatusCode::NOT_FOUND, "not found"),
+        Ok(Some(value)) => {
+            tracing::info!(status = 200, "client request");
+            (StatusCode::OK, Json(value)).into_response()
+        }
+        Ok(None) => {
+            tracing::info!(status = 404, "client request");
+            error(StatusCode::NOT_FOUND, "not found")
+        }
         Err(err) => dispatch_error(&err, forwarded, "GET", &key, None).await,
     }
 }
 
+#[tracing::instrument(skip_all, fields(node = node.id(), method = "PUT", key = %key))]
 async fn put_key(
     State(node): State<Arc<Node>>,
     Path(key): Path<String>,
@@ -54,9 +62,13 @@ async fn put_key(
     let forwarded = headers.contains_key("x-raft-forwarded");
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
-        Err(_) => return error(StatusCode::BAD_REQUEST, "body must be JSON"),
+        Err(err) => {
+            tracing::warn!(%err, "rejected put; body is not JSON");
+            return error(StatusCode::BAD_REQUEST, "body must be JSON");
+        }
     };
     if !value.is_object() {
+        tracing::warn!("rejected put; body is not a JSON object");
         return error(StatusCode::BAD_REQUEST, "body must be a JSON object");
     }
     match node
@@ -66,11 +78,15 @@ async fn put_key(
         })
         .await
     {
-        Ok(()) => (StatusCode::CREATED, Json(value)).into_response(),
+        Ok(()) => {
+            tracing::info!(status = 201, "client request");
+            (StatusCode::CREATED, Json(value)).into_response()
+        }
         Err(err) => dispatch_error(&err, forwarded, "PUT", &key, Some(body.to_vec())).await,
     }
 }
 
+#[tracing::instrument(skip_all, fields(node = node.id(), method = "DELETE", key = %key))]
 async fn delete_key(
     State(node): State<Arc<Node>>,
     Path(key): Path<String>,
@@ -78,7 +94,10 @@ async fn delete_key(
 ) -> Response {
     let forwarded = headers.contains_key("x-raft-forwarded");
     match node.propose(Command::Delete { key: key.clone() }).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            tracing::info!(status = 204, "client request");
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(err) => dispatch_error(&err, forwarded, "DELETE", &key, None).await,
     }
 }
@@ -92,6 +111,7 @@ async fn dispatch_error(
 ) -> Response {
     match err {
         RaftError::NotLeader { leader: Some(addr) } if !forwarded => {
+            tracing::debug!(leader = %addr, "forwarding client request");
             match net::forward(
                 addr,
                 method,
@@ -101,14 +121,22 @@ async fn dispatch_error(
             )
             .await
             {
-                Ok((status, response)) => passthrough(status, response),
-                Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "leader unreachable"),
+                Ok((status, response)) => {
+                    tracing::info!(status, leader = %addr, "forwarded client request");
+                    passthrough(status, response)
+                }
+                Err(err) => {
+                    tracing::warn!(leader = %addr, %err, "leader unreachable");
+                    error(StatusCode::SERVICE_UNAVAILABLE, "leader unreachable")
+                }
             }
         }
         RaftError::NotLeader { leader: None } => {
+            tracing::warn!("client request failed; no leader");
             error(StatusCode::SERVICE_UNAVAILABLE, "no leader")
         }
         RaftError::NotLeader { .. } | RaftError::Unavailable => {
+            tracing::warn!("client request failed; quorum unavailable");
             error(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
         }
     }

@@ -2,7 +2,7 @@ use key_value_store::{Peer, ServerConfig, serve};
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::try_init().ok();
+    init_tracing();
     let config = match parse_args() {
         Ok(config) => config,
         Err(err) => {
@@ -14,6 +14,15 @@ async fn main() {
         eprintln!("server error: {err}");
         std::process::exit(1);
     }
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("key_value_store=info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .try_init()
+        .ok();
 }
 
 fn parse_args() -> Result<ServerConfig, String> {
@@ -87,5 +96,8 @@ fn usage() -> &'static str {
      DELETE /{key}   204 once a majority commits the delete\n\
      \n\
      Followers forward to the leader. A member that cannot reach a majority\n\
-     returns 503, so a partition does not create two successful writers."
+     returns 503, so a partition does not create two successful writers.\n\
+     \n\
+     Diagnostics go to stderr. RUST_LOG selects the level, for example\n\
+     RUST_LOG=key_value_store=debug. The default is info for this crate."
 }

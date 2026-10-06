@@ -30,23 +30,30 @@ pub(crate) async fn call(
 
 pub async fn post_json(addr: &str, path: &str, body: &Value) -> Result<Value, String> {
     let bytes = serde_json::to_vec(body).map_err(|err| err.to_string())?;
-    let (status, response) = tokio::time::timeout(
-        RPC_TIMEOUT,
-        request(
-            addr,
-            "POST",
-            path,
-            Some(&bytes),
-            &[("content-type", "application/json")],
-        ),
-    )
-    .await
-    .map_err(|_| "timeout".to_string())?
-    .map_err(|err| err)?;
-    if status != 200 {
-        return Err(format!("status {status}"));
+    let result = async {
+        let (status, response) = tokio::time::timeout(
+            RPC_TIMEOUT,
+            request(
+                addr,
+                "POST",
+                path,
+                Some(&bytes),
+                &[("content-type", "application/json")],
+            ),
+        )
+        .await
+        .map_err(|_| "timeout".to_string())?
+        .map_err(|err| err)?;
+        if status != 200 {
+            return Err(format!("status {status}"));
+        }
+        serde_json::from_slice(&response).map_err(|err| err.to_string())
     }
-    serde_json::from_slice(&response).map_err(|err| err.to_string())
+    .await;
+    if let Err(err) = &result {
+        tracing::debug!(%addr, %path, %err, "raft rpc failed");
+    }
+    result
 }
 
 pub async fn forward(

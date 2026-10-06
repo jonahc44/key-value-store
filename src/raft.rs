@@ -89,6 +89,7 @@ struct Inner {
 }
 
 pub struct Node {
+    id: u64,
     inner: Mutex<Inner>,
     peer_locks: HashMap<u64, Mutex<()>>,
     running: AtomicBool,
@@ -125,7 +126,15 @@ impl Node {
             inner.become_leader();
         }
 
+        tracing::info!(
+            node = inner.id,
+            members = inner.peers.len(),
+            term = inner.current_term,
+            role = ?inner.role,
+            "raft started"
+        );
         let node = Arc::new(Self {
+            id: inner.id,
             inner: Mutex::new(inner),
             peer_locks,
             running: AtomicBool::new(true),
@@ -135,7 +144,12 @@ impl Node {
         node
     }
 
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     pub(crate) fn shutdown(&self) {
+        tracing::debug!(node = self.id, "stopping raft ticker");
         self.running.store(false, Ordering::Relaxed);
     }
 
@@ -158,8 +172,12 @@ impl Node {
                 });
             }
             let term = inner.current_term;
+            let node = inner.id;
+            let (op, key) = command_fields(&command);
+            let key = key.to_string();
             inner.log.push(Entry { term, command });
             let index = inner.last_index();
+            tracing::debug!(node, term, index, op, key, "proposed");
             let (tx, rx) = oneshot::channel();
             inner.waiters.insert(index, tx);
             inner.persist();
@@ -173,10 +191,17 @@ impl Node {
                 let mut inner = self.inner.lock().await;
                 inner.waiters.remove(&index);
                 if inner.role != Role::Leader {
+                    tracing::warn!(node = inner.id, index, "proposal lost leadership");
                     Err(RaftError::NotLeader {
                         leader: inner.leader_addr(),
                     })
                 } else {
+                    tracing::warn!(
+                        node = inner.id,
+                        index,
+                        term = inner.current_term,
+                        "proposal timed out before commit"
+                    );
                     Err(RaftError::Unavailable)
                 }
             }
@@ -202,6 +227,7 @@ impl Node {
             });
         }
         if !quorum_ok {
+            tracing::warn!(node = inner.id, term, "linearizable read failed; no quorum");
             return Err(RaftError::Unavailable);
         }
         Ok(inner.data.get(&key).cloned())
@@ -257,6 +283,19 @@ impl Node {
             inner.voted_for = Some(candidate);
             inner.refresh_follower_timer();
             inner.persist();
+            tracing::info!(
+                node = inner.id,
+                candidate,
+                term = inner.current_term,
+                "granted vote"
+            );
+        } else {
+            tracing::debug!(
+                node = inner.id,
+                candidate,
+                term = inner.current_term,
+                "denied vote"
+            );
         }
         json!({ "term": inner.current_term, "vote_granted": granted })
     }
@@ -266,6 +305,13 @@ impl Node {
         let term = u64_field(req, "term").unwrap_or(0);
         let leader_id = u64_field(req, "leader_id").unwrap_or(0);
         if term < inner.current_term {
+            tracing::debug!(
+                node = inner.id,
+                leader = leader_id,
+                term,
+                current = inner.current_term,
+                "rejected append from older term"
+            );
             return json!({
                 "term": inner.current_term,
                 "success": false,
@@ -285,6 +331,13 @@ impl Node {
         let prev_term = u64_field(req, "prev_log_term").unwrap_or(0);
         if prev > inner.last_index() as u64 {
             let next = inner.last_index() + 1;
+            tracing::debug!(
+                node = inner.id,
+                leader = leader_id,
+                prev,
+                last = inner.last_index(),
+                "rejected append; log is shorter than leader expects"
+            );
             return json!({
                 "term": inner.current_term,
                 "success": false,
@@ -293,6 +346,14 @@ impl Node {
         }
         let prev_index = prev as usize;
         if inner.log[prev_index].term != prev_term {
+            tracing::info!(
+                node = inner.id,
+                leader = leader_id,
+                prev,
+                prev_term,
+                local_term = inner.log[prev_index].term,
+                "rejected append; log conflict"
+            );
             return json!({
                 "term": inner.current_term,
                 "success": false,
@@ -313,6 +374,12 @@ impl Node {
                 };
                 if index < inner.log.len() {
                     if inner.log[index].term != entry.term {
+                        tracing::info!(
+                            node = inner.id,
+                            index,
+                            kept = inner.log.len().saturating_sub(index),
+                            "truncated conflicting log suffix"
+                        );
                         inner.log.truncate(index);
                         inner.log.push(entry);
                         dirty = true;
@@ -417,6 +484,11 @@ impl Node {
             inner.election_timeout = random_timeout(inner.id);
             // A failed attempt must not look like a fresh leader heartbeat.
             inner.election_deadline = Instant::now() + inner.election_timeout;
+            tracing::info!(
+                node = inner.id,
+                term = inner.current_term + 1,
+                "starting election"
+            );
             if inner.quorum() <= 1 {
                 inner.current_term = inner.current_term.saturating_add(1).max(1);
                 inner.voted_for = Some(inner.id);
@@ -476,8 +548,20 @@ impl Node {
             return;
         }
         if grants < campaign.quorum {
+            tracing::debug!(
+                node = campaign.candidate_id,
+                grants,
+                quorum = campaign.quorum,
+                "prevote failed"
+            );
             return;
         }
+        tracing::debug!(
+            node = campaign.candidate_id,
+            grants,
+            term = campaign.current_term + 1,
+            "prevote succeeded"
+        );
 
         let vote_req = {
             let mut inner = self.inner.lock().await;
@@ -786,6 +870,7 @@ impl Inner {
         self.last_quorum_ok = now;
         self.advance_commit();
         self.persist();
+        tracing::info!(node = self.id, term = self.current_term, "became leader");
     }
 
     fn step_down(&mut self) {
@@ -797,6 +882,11 @@ impl Inner {
         self.votes = 0;
         self.election_timeout = random_timeout(self.id);
         self.election_deadline = Instant::now() + self.election_timeout;
+        tracing::warn!(
+            node = self.id,
+            term = self.current_term,
+            "stepped down; lost quorum"
+        );
         self.fail_uncommitted();
     }
 
@@ -804,6 +894,12 @@ impl Inner {
         if term <= self.current_term {
             return;
         }
+        tracing::info!(
+            node = self.id,
+            from = self.current_term,
+            to = term,
+            "observed higher term"
+        );
         self.current_term = term;
         self.voted_for = None;
         self.role = Role::Follower;
@@ -824,6 +920,13 @@ impl Inner {
             .copied()
             .filter(|index| *index > commit)
             .collect();
+        if !pending.is_empty() {
+            tracing::debug!(
+                node = self.id,
+                count = pending.len(),
+                "failing uncommitted proposals"
+            );
+        }
         for index in pending {
             if let Some(waiter) = self.waiters.remove(&index) {
                 let _ = waiter.send(false);
@@ -852,6 +955,12 @@ impl Inner {
             }
         }
         if commit > self.commit_index {
+            tracing::debug!(
+                node = self.id,
+                from = self.commit_index,
+                to = commit,
+                "advanced commit index"
+            );
             self.commit_index = commit;
             self.apply();
             self.persist();
@@ -861,14 +970,19 @@ impl Inner {
     fn apply(&mut self) {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            match &self.log[self.last_applied].command {
+            let index = self.last_applied;
+            match &self.log[index].command {
                 Command::Put { key, value } => {
+                    tracing::info!(node = self.id, index, key, "applied put");
                     self.data.insert(key.clone(), value.clone());
                 }
                 Command::Delete { key } => {
+                    tracing::info!(node = self.id, index, key, "applied delete");
                     self.data.remove(key);
                 }
-                Command::Noop => {}
+                Command::Noop => {
+                    tracing::debug!(node = self.id, index, "applied noop");
+                }
             }
             if let Some(waiter) = self.waiters.remove(&self.last_applied) {
                 let _ = waiter.send(true);
@@ -880,7 +994,10 @@ impl Inner {
         let Some(dir) = &self.data_dir else {
             return;
         };
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(err) = std::fs::create_dir_all(dir) {
+            tracing::error!(node = self.id, path = %dir.display(), %err, "failed to create data dir");
+            return;
+        }
         let path = dir.join(format!("{}.json", self.id));
         let tmp = dir.join(format!("{}.json.tmp", self.id));
         let log: Vec<Value> = self.log.iter().map(entry_json).collect();
@@ -890,8 +1007,13 @@ impl Inner {
             "commit_index": self.commit_index,
             "log": log,
         });
-        if std::fs::write(&tmp, serde_json::to_vec(&body).unwrap_or_default()).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        let bytes = serde_json::to_vec(&body).unwrap_or_default();
+        if let Err(err) = std::fs::write(&tmp, &bytes) {
+            tracing::error!(node = self.id, path = %tmp.display(), %err, "failed to write raft state");
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, &path) {
+            tracing::error!(node = self.id, path = %path.display(), %err, "failed to replace raft state");
         }
     }
 
@@ -901,10 +1023,11 @@ impl Inner {
         };
         let path = dir.join(format!("{}.json", self.id));
         let Ok(bytes) = std::fs::read(&path) else {
+            tracing::debug!(node = self.id, path = %path.display(), "no raft state to load");
             return;
         };
         let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-            eprintln!("ignoring unreadable raft state at {}", path.display());
+            tracing::warn!(node = self.id, path = %path.display(), "ignoring unreadable raft state");
             return;
         };
         let Some(entries) = value.get("log").and_then(|v| v.as_array()) else {
@@ -927,6 +1050,21 @@ impl Inner {
         self.last_applied = 0;
         self.data.clear();
         self.apply();
+        tracing::info!(
+            node = self.id,
+            term = self.current_term,
+            commit = self.commit_index,
+            entries = self.last_index(),
+            "loaded raft state"
+        );
+    }
+}
+
+fn command_fields(command: &Command) -> (&'static str, &str) {
+    match command {
+        Command::Noop => ("noop", ""),
+        Command::Put { key, .. } => ("put", key),
+        Command::Delete { key } => ("del", key),
     }
 }
 
