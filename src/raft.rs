@@ -10,6 +10,8 @@
 //! configuration in its log, committed or not, and falls back to the previous
 //! one if that entry is truncated. A new server joins as a learner that
 //! receives the log without voting, and is promoted once it has caught up.
+//! Any member but the last voter can be removed. A leader that removes itself
+//! leads until the change commits, then hands off to the most caught-up voter.
 
 use crate::net;
 use crate::telemetry::{Gauges, Telemetry};
@@ -126,6 +128,9 @@ struct Inner {
     election_deadline: Instant,
     last_leader_contact: Instant,
     election_in_progress: bool,
+    /// Set while a leader that removed itself hands leadership to a voter;
+    /// new proposals are refused so none are lost at the step-down.
+    transferring: bool,
     last_heartbeat_sent: Instant,
     last_quorum_ok: Instant,
     data_dir: Option<PathBuf>,
@@ -261,7 +266,7 @@ impl Node {
     pub(crate) async fn propose(self: &Arc<Self>, command: Command) -> Result<(), RaftError> {
         let (index, rx) = {
             let mut inner = self.inner.lock().await;
-            if inner.role != Role::Leader {
+            if inner.role != Role::Leader || inner.transferring {
                 return Err(RaftError::NotLeader {
                     leader: inner.leader_addr(),
                 });
@@ -338,6 +343,32 @@ impl Node {
         Ok(self.membership().await)
     }
 
+    /// Remove the member `id`. Safe to retry: removing a server that is not a
+    /// member succeeds without a change. A removed follower or learner is not
+    /// told; it never receives the entry that drops it, and should be
+    /// stopped. Its pre-votes are refused while the leader is healthy. A
+    /// leader that removes itself keeps leading until the change commits,
+    /// then hands leadership to a remaining voter (see `hand_off`).
+    pub(crate) async fn remove_member(self: &Arc<Self>, id: u64) -> Result<Value, RaftError> {
+        self.change_membership(|current| {
+            if current.find(id).is_none() {
+                return Ok(None);
+            }
+            let mut next = current.clone();
+            next.voters.retain(|peer| peer.id != id);
+            next.learners.retain(|peer| peer.id != id);
+            if next.voters.is_empty() {
+                return Err(RaftError::Rejected(format!(
+                    "member {id} is the last voter"
+                )));
+            }
+            Ok(Some(next))
+        })
+        .await?;
+
+        Ok(self.membership().await)
+    }
+
     /// Append a new configuration computed by `change` and wait for it to
     /// commit. `change` returns `None` when the membership already matches.
     async fn change_membership(
@@ -346,7 +377,7 @@ impl Node {
     ) -> Result<(), RaftError> {
         let (index, rx) = {
             let mut inner = self.inner.lock().await;
-            if inner.role != Role::Leader {
+            if inner.role != Role::Leader || inner.transferring {
                 return Err(RaftError::NotLeader {
                     leader: inner.leader_addr(),
                 });
@@ -383,6 +414,11 @@ impl Node {
                     return Err(RaftError::NotLeader {
                         leader: inner.leader_addr(),
                     });
+                }
+                if !inner.membership.is_learner(id) && !inner.membership.is_voter(id) {
+                    return Err(RaftError::Rejected(format!(
+                        "member {id} left the configuration during catch-up"
+                    )));
                 }
                 let matched = inner.match_index.get(&id).copied().unwrap_or(0);
                 if matched >= inner.commit_index {
@@ -678,13 +714,20 @@ impl Node {
         enum Action {
             Elect,
             Heartbeat,
+            HandOff,
             None,
         }
         let action = {
             let mut inner = self.inner.lock().await;
             if inner.role == Role::Leader {
-                if inner.last_quorum_ok.elapsed() >= inner.election_timeout {
-                    inner.step_down();
+                if !inner.is_voter()
+                    && inner.config_index <= inner.commit_index
+                    && !inner.transferring
+                {
+                    inner.transferring = true;
+                    Action::HandOff
+                } else if inner.last_quorum_ok.elapsed() >= inner.election_timeout {
+                    inner.step_down("lost_quorum");
                     Action::None
                 } else if inner.last_heartbeat_sent.elapsed() >= HEARTBEAT {
                     inner.last_heartbeat_sent = Instant::now();
@@ -702,36 +745,117 @@ impl Node {
             }
         };
         match action {
-            Action::Elect => self.start_election().await,
+            Action::Elect => self.start_election(false).await,
             Action::Heartbeat => {
                 let _ = self.replicate_all().await;
             }
+            Action::HandOff => self.hand_off().await,
             Action::None => {}
         }
     }
 
-    async fn start_election(self: &Arc<Self>) {
-        {
-            let mut inner = self.inner.lock().await;
-            if inner.role == Role::Leader
-                || !inner.is_voter()
-                || inner.election_in_progress
-                || Instant::now() < inner.election_deadline
-            {
+    /// Step down once the configuration that removed this leader has
+    /// committed, first telling the most caught-up voter to start an election
+    /// at once (Raft thesis §3.10) so the cluster does not wait out an
+    /// election timeout. If the transfer fails the remaining voters elect a
+    /// leader on their own.
+    async fn hand_off(self: &Arc<Self>) {
+        let (term, target) = {
+            let inner = self.inner.lock().await;
+            if inner.role != Role::Leader {
                 return;
             }
-            inner.election_in_progress = true;
+            let target = inner
+                .other_voters()
+                .into_iter()
+                .max_by_key(|peer| inner.match_index.get(&peer.id).copied().unwrap_or(0));
+            (inner.current_term, target)
+        };
+        // Bring the target fully up to date, or the others may refuse it.
+        let caught_up = match &target {
+            Some(peer) => matches!(
+                self.replicate_one(peer.clone(), true).await,
+                RpcOutcome::CaughtUp
+            ),
+            None => false,
+        };
+        {
+            let mut inner = self.inner.lock().await;
+            if inner.role != Role::Leader || inner.current_term != term {
+                return;
+            }
+            inner.step_down("removed");
         }
-        // Spread nodes that time out together so one can win the prevote
-        // before the other starts a competing term.
-        tokio::time::sleep(Duration::from_millis(50 + random_below(200))).await;
+        let Some(peer) = target.filter(|_| caught_up) else {
+            tracing::warn!(node = self.id, term, "stepped down without a transfer target");
+            return;
+        };
+        let request = json!({ "term": term, "leader_id": self.id });
+        match self.peer_rpc(&peer, "/raft/timeout-now", &request).await {
+            Ok(_) => {
+                tracing::info!(node = self.id, target = peer.id, term, "transferred leadership");
+                self.telemetry.event(
+                    "leadership_transferred",
+                    json!({ "term": term, "target": peer.id }),
+                );
+            }
+            Err(err) => {
+                tracing::warn!(node = self.id, target = peer.id, %err, "leadership transfer failed")
+            }
+        }
+    }
+
+    /// The leader asks this server to campaign immediately, skipping the
+    /// prevote: the leader is stepping down, so the other voters' leader
+    /// lease would refuse it.
+    pub(crate) async fn handle_timeout_now(self: &Arc<Self>, req: &Value) -> Value {
+        let term = u64_field(req, "term").unwrap_or(0);
+        let leader = u64_field(req, "leader_id");
+        let accepted = {
+            let inner = self.inner.lock().await;
+            term == inner.current_term
+                && inner.role == Role::Follower
+                && inner.is_voter()
+                && leader.is_some()
+                && inner.leader_id == leader
+        };
+        if accepted {
+            tracing::info!(node = self.id, term, "leader handed off; starting election");
+            let this = Arc::clone(self);
+            tokio::spawn(async move { this.start_election(true).await });
+        }
+        let term = self.inner.lock().await.current_term;
+        json!({ "term": term, "accepted": accepted })
+    }
+
+    /// `transfer` campaigns at once on the leader's request (`TimeoutNow`),
+    /// without the jitter or the prevote.
+    async fn start_election(self: &Arc<Self>, transfer: bool) {
+        if !transfer {
+            {
+                let mut inner = self.inner.lock().await;
+                if inner.role == Role::Leader
+                    || !inner.is_voter()
+                    || inner.election_in_progress
+                    || Instant::now() < inner.election_deadline
+                {
+                    return;
+                }
+                inner.election_in_progress = true;
+            }
+            // Spread nodes that time out together so one can win the prevote
+            // before the other starts a competing term.
+            tokio::time::sleep(Duration::from_millis(50 + random_below(200))).await;
+        }
         let campaign = {
             let mut inner = self.inner.lock().await;
-            inner.election_in_progress = false;
+            if !transfer {
+                inner.election_in_progress = false;
+            }
             if !self.running.load(Ordering::Relaxed)
                 || inner.role == Role::Leader
                 || !inner.is_voter()
-                || Instant::now() < inner.election_deadline
+                || (!transfer && Instant::now() < inner.election_deadline)
             {
                 return;
             }
@@ -768,64 +892,67 @@ impl Node {
             }
         };
 
-        let mut grants = 1usize;
-        let mut higher_term = None;
-        let mut pending = JoinSet::new();
-        let peer_count = campaign.peers.len();
-        for peer in campaign.peers {
-            let req = json!({
-                "term": campaign.current_term + 1,
-                "candidate_id": campaign.candidate_id,
-                "last_log_index": campaign.last_log_index,
-                "last_log_term": campaign.last_log_term,
-                "prevote": true,
-            });
-            let this = Arc::clone(self);
-            pending.spawn(async move { this.peer_rpc(&peer, "/raft/request-vote", &req).await });
-        }
-        let mut answered = 0usize;
-        while let Some(joined) = pending.join_next().await {
-            answered += 1;
-            if let Ok(Ok(response)) = joined {
-                let term = u64_field(&response, "term").unwrap_or(0);
-                if term > campaign.current_term {
-                    higher_term = Some(term);
+        if !transfer {
+            let mut grants = 1usize;
+            let mut higher_term = None;
+            let mut pending = JoinSet::new();
+            let peer_count = campaign.peers.len();
+            for peer in campaign.peers {
+                let req = json!({
+                    "term": campaign.current_term + 1,
+                    "candidate_id": campaign.candidate_id,
+                    "last_log_index": campaign.last_log_index,
+                    "last_log_term": campaign.last_log_term,
+                    "prevote": true,
+                });
+                let this = Arc::clone(self);
+                pending.spawn(async move { this.peer_rpc(&peer, "/raft/request-vote", &req).await });
+            }
+            let mut answered = 0usize;
+            while let Some(joined) = pending.join_next().await {
+                answered += 1;
+                if let Ok(Ok(response)) = joined {
+                    let term = u64_field(&response, "term").unwrap_or(0);
+                    if term > campaign.current_term {
+                        higher_term = Some(term);
+                        break;
+                    }
+                    if response
+                        .get("vote_granted")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        grants += 1;
+                    }
+                }
+                let outstanding = peer_count - answered;
+                if grants >= campaign.quorum || grants + outstanding < campaign.quorum {
                     break;
                 }
-                if response
-                    .get("vote_granted")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    grants += 1;
-                }
             }
-            let outstanding = peer_count - answered;
-            if grants >= campaign.quorum || grants + outstanding < campaign.quorum {
-                break;
+            drop(pending);
+            if let Some(term) = higher_term {
+                self.inner.lock().await.observe_term(term);
+                return;
             }
-        }
-        drop(pending);
-        if let Some(term) = higher_term {
-            self.inner.lock().await.observe_term(term);
-            return;
-        }
-        if grants < campaign.quorum {
-            self.telemetry.prevotes_failed.inc();
+            if grants < campaign.quorum {
+                self.telemetry.prevotes_failed.inc();
+                tracing::debug!(
+                    node = campaign.candidate_id,
+                    grants,
+                    quorum = campaign.quorum,
+                    "prevote failed"
+                );
+                return;
+            }
             tracing::debug!(
                 node = campaign.candidate_id,
                 grants,
-                quorum = campaign.quorum,
-                "prevote failed"
+                term = campaign.current_term + 1,
+                "prevote succeeded"
             );
-            return;
+
         }
-        tracing::debug!(
-            node = campaign.candidate_id,
-            grants,
-            term = campaign.current_term + 1,
-            "prevote succeeded"
-        );
 
         let vote_req = {
             let mut inner = self.inner.lock().await;
@@ -1022,6 +1149,11 @@ impl Node {
             if inner.role != Role::Leader || inner.current_term != term {
                 return RpcOutcome::Unreachable;
             }
+            // The peer may have been removed while this RPC was in flight;
+            // recording its progress would bring its replication state back.
+            if inner.membership.find(peer.id).is_none() {
+                return RpcOutcome::Unreachable;
+            }
             if success {
                 let count = request
                     .get("entries")
@@ -1104,6 +1236,7 @@ impl Inner {
             election_deadline: now + election_timeout,
             last_leader_contact: now,
             election_in_progress: false,
+            transferring: false,
             last_heartbeat_sent: now,
             last_quorum_ok: now,
             data_dir,
@@ -1211,6 +1344,11 @@ impl Inner {
                     "learners": Membership::ids(&membership.learners),
                 }),
             );
+            for peer in self.membership.voters.iter().chain(&self.membership.learners) {
+                if membership.find(peer.id).is_none() {
+                    self.telemetry.forget_peer(peer.id);
+                }
+            }
         }
         self.membership = membership;
         self.config_index = index;
@@ -1285,7 +1423,7 @@ impl Inner {
         tracing::info!(node = self.id, term = self.current_term, "became leader");
     }
 
-    fn step_down(&mut self) {
+    fn step_down(&mut self, reason: &'static str) {
         if self.role == Role::Follower {
             return;
         }
@@ -1295,7 +1433,7 @@ impl Inner {
                 "stepped_down",
                 json!({
                     "term": self.current_term,
-                    "reason": "lost_quorum",
+                    "reason": reason,
                     "quorum_silence_ms": self.last_quorum_ok.elapsed().as_millis(),
                 }),
             );
@@ -1303,13 +1441,10 @@ impl Inner {
         self.role = Role::Follower;
         self.leader_id = None;
         self.votes = 0;
+        self.transferring = false;
         self.election_timeout = random_timeout(self.id);
         self.election_deadline = Instant::now() + self.election_timeout;
-        tracing::warn!(
-            node = self.id,
-            term = self.current_term,
-            "stepped down; lost quorum"
-        );
+        tracing::warn!(node = self.id, term = self.current_term, reason, "stepped down");
         self.fail_uncommitted();
     }
 
@@ -1337,6 +1472,7 @@ impl Inner {
         self.leader_id = None;
         self.votes = 0;
         self.election_in_progress = false;
+        self.transferring = false;
         self.election_timeout = random_timeout(self.id);
         self.election_deadline = Instant::now() + self.election_timeout;
         self.fail_uncommitted();

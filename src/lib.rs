@@ -458,6 +458,187 @@ mod tests {
         nodes.pop().unwrap().stop().await;
     }
 
+    async fn remove(addr: &str, id: u64) -> (u16, serde_json::Value) {
+        let (status, body) = call(addr, "DELETE", &format!("/cluster/members/{id}"), None)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    async fn learners(node: &Node) -> Vec<u64> {
+        node.membership().await["learners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|peer| peer["id"].as_u64().unwrap())
+            .collect()
+    }
+
+    async fn term(addr: &str) -> u64 {
+        let (_, body) = call(addr, "GET", "/cluster/metrics", None).await.unwrap();
+        String::from_utf8(body)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("raft_term "))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("raft_term gauge missing")
+    }
+
+    #[tokio::test]
+    async fn removed_followers_shrink_quorum() {
+        let mut nodes = cluster(3, None).await;
+        let leader = wait_leader(&nodes).await;
+        let leader_id = nodes[leader].node.id();
+        let leader_addr = nodes[leader].addr.clone();
+        assert_eq!(put(&leader_addr, "a", json!({"v": 1})).await.0, 201);
+        let followers: Vec<usize> = (0..nodes.len()).filter(|i| *i != leader).collect();
+        let (first, second) = (followers[0], followers[1]);
+        let first_id = nodes[first].node.id();
+        let second_id = nodes[second].node.id();
+
+        // Ask the member that is about to go, so the call is forwarded.
+        let (status, body) = remove(&nodes[first].addr, first_id).await;
+        assert_eq!(status, 200, "{body:?}");
+        let mut expected: Vec<u64> = vec![leader_id, second_id];
+        expected.sort_unstable();
+        assert_eq!(voters(&nodes[leader].node).await, expected);
+
+        // The removed node keeps running and campaigning, but must not
+        // depose the leader.
+        let before = term(&leader_addr).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(nodes[leader].node.is_leader().await);
+        assert_eq!(term(&leader_addr).await, before);
+        assert_eq!(put(&leader_addr, "b", json!({"v": 2})).await.0, 201);
+
+        // Removing again is a no-op.
+        assert_eq!(remove(&leader_addr, first_id).await.0, 200);
+
+        let (status, body) = remove(&leader_addr, second_id).await;
+        assert_eq!(status, 200, "{body:?}");
+        assert_eq!(voters(&nodes[leader].node).await, vec![leader_id]);
+
+        // With both removed nodes gone the leader is a quorum on its own;
+        // under the original configuration this write would fail.
+        let mut removed: Vec<Running> = Vec::new();
+        for index in [first.max(second), first.min(second)] {
+            removed.push(nodes.remove(index));
+        }
+        for node in removed {
+            node.stop().await;
+        }
+        let created = put(&leader_addr, "c", json!({"v": 3})).await;
+        assert_eq!(created.0, 201, "{created:?}");
+
+        // The leader no longer reports the removed peers.
+        let (_, body) = call(&leader_addr, "GET", "/cluster/metrics", None)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body).unwrap();
+        assert!(!text.contains(&format!("peer=\"{first_id}\"")), "{text}");
+
+        for node in nodes {
+            node.stop().await;
+        }
+    }
+
+    async fn events_of(node: &Node, kind: &str) -> Vec<serde_json::Value> {
+        node.telemetry()
+            .recent_events()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event"] == kind)
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn leader_removes_itself_and_hands_off() {
+        let mut nodes = cluster(3, None).await;
+        let leader = wait_leader(&nodes).await;
+        let old_id = nodes[leader].node.id();
+        assert_eq!(put(&nodes[leader].addr, "a", json!({"v": 1})).await.0, 201);
+
+        // Go through a follower so the request is forwarded to the leader.
+        let follower = nodes[(leader + 1) % nodes.len()].addr.clone();
+        let (status, body) = remove(&follower, old_id).await;
+        assert_eq!(status, 200, "{body:?}");
+        assert!(!voters(&nodes[leader].node).await.contains(&old_id));
+
+        let old = nodes.remove(leader);
+        let next = wait_leader(&nodes).await;
+        assert!(!old.node.is_leader().await);
+        let stepped = events_of(&old.node, "stepped_down").await;
+        assert!(stepped.iter().any(|event| event["reason"] == "removed"), "{stepped:?}");
+        let transferred = events_of(&old.node, "leadership_transferred").await;
+        assert_eq!(
+            transferred.last().map(|event| event["target"].as_u64()),
+            Some(Some(nodes[next].node.id())),
+            "{transferred:?}"
+        );
+
+        // The removed leader no longer counts toward quorum.
+        old.stop().await;
+        let created = put(&nodes[next].addr, "b", json!({"v": 2})).await;
+        assert_eq!(created.0, 201, "{created:?}");
+        for node in &nodes {
+            wait_local(&node.node, "a", &json!({"v": 1})).await;
+            wait_local(&node.node, "b", &json!({"v": 2})).await;
+        }
+
+        // Down to two voters, removing the leader leaves one that leads alone.
+        let survivor_id = nodes[1 - next].node.id();
+        let (status, body) = remove(&nodes[next].addr, nodes[next].node.id()).await;
+        assert_eq!(status, 200, "{body:?}");
+        let gone = nodes.remove(next);
+        assert_eq!(wait_leader(&nodes).await, 0);
+        gone.stop().await;
+        assert_eq!(voters(&nodes[0].node).await, vec![survivor_id]);
+        let created = put(&nodes[0].addr, "c", json!({"v": 3})).await;
+        assert_eq!(created.0, 201, "{created:?}");
+
+        // The last voter cannot go, and unknown ids are already removed.
+        let (status, body) = remove(&nodes[0].addr, survivor_id).await;
+        assert_eq!(status, 409, "{body:?}");
+        assert_eq!(remove(&nodes[0].addr, 99).await.0, 200);
+
+        for node in nodes {
+            node.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stuck_learner_can_be_removed() {
+        let nodes = cluster(3, None).await;
+        let leader = wait_leader(&nodes).await;
+        let leader_addr = nodes[leader].addr.clone();
+
+        // Nothing listens on port 1, so the learner never catches up.
+        let body = serde_json::to_vec(&json!({"id": 4, "addr": "127.0.0.1:1"})).unwrap();
+        let (status, _) = crate::net::forward(
+            &leader_addr,
+            "POST",
+            "/cluster/members",
+            Some(body),
+            api::MEMBER_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 503);
+        assert_eq!(learners(&nodes[leader].node).await, vec![4]);
+
+        let (status, body) = remove(&leader_addr, 4).await;
+        assert_eq!(status, 200, "{body:?}");
+        assert!(learners(&nodes[leader].node).await.is_empty());
+        assert_eq!(voters(&nodes[leader].node).await, vec![1, 2, 3]);
+        assert_eq!(put(&leader_addr, "k", json!({"v": 1})).await.0, 201);
+
+        for node in nodes {
+            node.stop().await;
+        }
+    }
+
     #[tokio::test]
     async fn dropped_peer_is_recorded() {
         let dir = std::env::temp_dir().join(format!(

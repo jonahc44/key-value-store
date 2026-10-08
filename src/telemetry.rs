@@ -145,15 +145,17 @@ pub(crate) enum ClientOp {
     Delete,
     ListMembers,
     AddMember,
+    RemoveMember,
 }
 
 impl ClientOp {
-    const ALL: [ClientOp; 5] = [
+    const ALL: [ClientOp; 6] = [
         ClientOp::Get,
         ClientOp::Put,
         ClientOp::Delete,
         ClientOp::ListMembers,
         ClientOp::AddMember,
+        ClientOp::RemoveMember,
     ];
 
     /// The client operation a request performs, or `None` for internal and
@@ -165,6 +167,9 @@ impl ClientOp {
                 "POST" => Some(ClientOp::AddMember),
                 _ => None,
             };
+        }
+        if path.starts_with("/cluster/members/") {
+            return (method == "DELETE").then_some(ClientOp::RemoveMember);
         }
         if path.starts_with("/raft/") || path.starts_with("/cluster/") {
             return None;
@@ -184,6 +189,7 @@ impl ClientOp {
             ClientOp::Delete => "delete",
             ClientOp::ListMembers => "list_members",
             ClientOp::AddMember => "add_member",
+            ClientOp::RemoveMember => "remove_member",
         }
     }
 }
@@ -367,6 +373,12 @@ impl Telemetry {
                 self.event("persist_failed", json!({ "error": error }));
             }
         }
+    }
+
+    /// Drop the stats of a peer that left the configuration, so it is not
+    /// reported as down forever.
+    pub(crate) fn forget_peer(&self, peer: u64) {
+        lock(&self.peers).remove(&peer);
     }
 
     /// Record the outcome of one Raft RPC to `peer` and report the peer

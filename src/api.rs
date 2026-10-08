@@ -10,7 +10,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -25,11 +25,13 @@ pub fn router(node: Arc<Node>) -> Router {
     // per-request middleware.
     let client = Router::new()
         .route("/cluster/members", get(list_members).post(add_member))
+        .route("/cluster/members/{id}", delete(remove_member))
         .route("/{key}", get(get_key).put(put_key).delete(delete_key))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&node), track));
     Router::new()
         .route("/raft/request-vote", post(request_vote))
         .route("/raft/append-entries", post(append_entries))
+        .route("/raft/timeout-now", post(timeout_now))
         .route("/cluster/metrics", get(metrics))
         .route("/cluster/events", get(events))
         .merge(client)
@@ -73,6 +75,10 @@ async fn append_entries(State(node): State<Arc<Node>>, Json(body): Json<Value>) 
     Json(node.handle_append_entries(&body).await)
 }
 
+async fn timeout_now(State(node): State<Arc<Node>>, Json(body): Json<Value>) -> Json<Value> {
+    Json(node.handle_timeout_now(&body).await)
+}
+
 async fn list_members(State(node): State<Arc<Node>>) -> Json<Value> {
     Json(node.membership().await)
 }
@@ -111,6 +117,34 @@ async fn add_member(State(node): State<Arc<Node>>, headers: HeaderMap, body: Byt
                 "/cluster/members",
                 Some(body.to_vec()),
                 MEMBER_TIMEOUT,
+            )
+            .await
+        }
+    }
+}
+
+#[tracing::instrument(skip_all, fields(node = node.id(), method = "DELETE", path = "/cluster/members", member = id))]
+async fn remove_member(
+    State(node): State<Arc<Node>>,
+    Path(id): Path<u64>,
+    headers: HeaderMap,
+) -> Response {
+    let forwarded = headers.contains_key("x-raft-forwarded");
+    tracing::info!(member = id, "removing member");
+    match node.remove_member(id).await {
+        Ok(membership) => {
+            tracing::info!(status = 200, member = id, "member removed");
+            (StatusCode::OK, Json(membership)).into_response()
+        }
+        Err(err) => {
+            dispatch_error(
+                &node,
+                &err,
+                forwarded,
+                "DELETE",
+                &format!("/cluster/members/{id}"),
+                None,
+                FORWARD_TIMEOUT,
             )
             .await
         }
