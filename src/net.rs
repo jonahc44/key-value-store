@@ -56,6 +56,27 @@ pub async fn post_json(addr: &str, path: &str, body: &Value) -> Result<Value, St
     result
 }
 
+pub(crate) async fn post(
+    addr: &str,
+    path: &str,
+    body: &Value,
+    timeout: Duration,
+) -> Result<(u16, Vec<u8>), String> {
+    let bytes = serde_json::to_vec(body).map_err(|err| err.to_string())?;
+    tokio::time::timeout(
+        timeout,
+        request(
+            addr,
+            "POST",
+            path,
+            Some(&bytes),
+            &[("content-type", "application/json")],
+        ),
+    )
+    .await
+    .map_err(|_| "timeout".to_string())?
+}
+
 pub async fn forward(
     addr: &str,
     method: &str,

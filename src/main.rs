@@ -31,6 +31,7 @@ fn parse_args() -> Result<ServerConfig, String> {
     let mut listen = "127.0.0.1:2379".to_string();
     let mut peers = Vec::new();
     let mut data_dir = None;
+    let mut join = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -74,26 +75,46 @@ fn parse_args() -> Result<ServerConfig, String> {
                         .into(),
                 );
             }
+            "--join" => {
+                join = Some(
+                    args.next()
+                        .ok_or_else(|| "--join needs an address".to_string())?,
+                );
+            }
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
+    }
+    if join.is_some() && !peers.is_empty() {
+        return Err("--join and --peer cannot be combined".to_string());
     }
     Ok(ServerConfig {
         id,
         listen,
         peers,
         data_dir,
+        join,
     })
 }
 
 fn usage() -> &'static str {
-    "usage: key-value-store [--id N] [--listen ADDR] [--peer ID=ADDR]... [--data-dir PATH]\n\
+    "usage: key-value-store [--id N] [--listen ADDR] [--peer ID=ADDR]... [--join ADDR] [--data-dir PATH]\n\
      \n\
-     One process is one member of a Raft cluster. Pass every member, including\n\
-     this one, via --peer. With no --peer flags the process is a one-node cluster.\n\
+     One process is one member of a Raft cluster. To bootstrap a cluster, pass\n\
+     every initial member, including this one, via --peer. With no --peer flags\n\
+     the process is a one-node cluster.\n\
+     \n\
+     To grow a running cluster, start a new process with a fresh id and\n\
+     --join ADDR, where ADDR is any existing member. It joins as a non-voting\n\
+     learner, receives the log, and is promoted to voter once caught up.\n\
+     --listen must be an address the other members can reach. After the first\n\
+     membership change, the log, not --peer, defines the cluster.\n\
      \n\
      GET    /{key}   200 and the JSON object, or 404\n\
      PUT    /{key}   JSON object body, 201 once a majority commits it\n\
      DELETE /{key}   204 once a majority commits the delete\n\
+     \n\
+     GET    /cluster/members   this member's view of voters and learners\n\
+     POST   /cluster/members   {\"id\": N, \"addr\": \"HOST:PORT\"} adds a member\n\
      \n\
      Followers forward to the leader. A member that cannot reach a majority\n\
      returns 503, so a partition does not create two successful writers.\n\

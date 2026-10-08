@@ -4,6 +4,12 @@
 //! before a write is applied or acknowledged. A member that cannot reach a
 //! majority refuses the client call, so a partition can serve from at most one
 //! side. That is the same consistency/partition choice etcd makes.
+//!
+//! Membership is stored in the log as `Command::Config` entries and changes
+//! one server at a time (Raft thesis §4.1). Every server uses the latest
+//! configuration in its log, committed or not, and falls back to the previous
+//! one if that entry is truncated. A new server joins as a learner that
+//! receives the log without voting, and is promoted once it has caught up.
 
 use crate::net;
 use serde_json::{Value, json};
@@ -18,8 +24,9 @@ use tokio::task::JoinSet;
 const HEARTBEAT: Duration = Duration::from_millis(40);
 const TICK: Duration = Duration::from_millis(20);
 const PROPOSE_TIMEOUT: Duration = Duration::from_millis(1500);
+const CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
     pub id: u64,
     pub addr: String,
@@ -31,6 +38,34 @@ pub struct Config {
     pub listen: String,
     pub peers: Vec<Peer>,
     pub data_dir: Option<PathBuf>,
+    pub join: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Membership {
+    voters: Vec<Peer>,
+    learners: Vec<Peer>,
+}
+
+impl Membership {
+    fn find(&self, id: u64) -> Option<&Peer> {
+        self.voters
+            .iter()
+            .chain(&self.learners)
+            .find(|peer| peer.id == id)
+    }
+
+    fn is_voter(&self, id: u64) -> bool {
+        self.voters.iter().any(|peer| peer.id == id)
+    }
+
+    fn is_learner(&self, id: u64) -> bool {
+        self.learners.iter().any(|peer| peer.id == id)
+    }
+
+    fn ids(peers: &[Peer]) -> Vec<u64> {
+        peers.iter().map(|peer| peer.id).collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +80,7 @@ pub(crate) enum Command {
     Noop,
     Put { key: String, value: Value },
     Delete { key: String },
+    Config(Membership),
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +92,10 @@ struct Entry {
 pub(crate) enum RaftError {
     NotLeader { leader: Option<String> },
     Unavailable,
+    /// Temporarily refused; the caller should retry.
+    Busy(String),
+    /// Refused because the request conflicts with the current membership.
+    Rejected(String),
 }
 
 enum RpcOutcome {
@@ -66,7 +106,9 @@ enum RpcOutcome {
 
 struct Inner {
     id: u64,
-    peers: Vec<Peer>,
+    bootstrap: Membership,
+    membership: Membership,
+    config_index: usize,
     role: Role,
     current_term: u64,
     voted_for: Option<u64>,
@@ -91,36 +133,33 @@ struct Inner {
 pub struct Node {
     id: u64,
     inner: Mutex<Inner>,
-    peer_locks: HashMap<u64, Mutex<()>>,
+    peer_locks: std::sync::Mutex<HashMap<u64, Arc<Mutex<()>>>>,
     running: AtomicBool,
 }
 
 impl Node {
-    pub fn start(mut config: Config) -> Arc<Self> {
-        if config.peers.is_empty() {
-            config.peers.push(Peer {
-                id: config.id,
-                addr: config.listen.clone(),
-            });
-        } else if !config.peers.iter().any(|peer| peer.id == config.id) {
-            config.peers.push(Peer {
-                id: config.id,
-                addr: config.listen.clone(),
-            });
-        }
-        config.peers.sort_by_key(|peer| peer.id);
-        config.peers.dedup_by_key(|peer| peer.id);
-
-        let mut peer_locks = HashMap::new();
-        for peer in &config.peers {
-            if peer.id != config.id {
-                peer_locks.insert(peer.id, Mutex::new(()));
+    pub fn start(config: Config) -> Arc<Self> {
+        let bootstrap = if config.join.is_some() {
+            Membership::default()
+        } else {
+            let mut voters = config.peers;
+            if !voters.iter().any(|peer| peer.id == config.id) {
+                voters.push(Peer {
+                    id: config.id,
+                    addr: config.listen.clone(),
+                });
             }
-        }
+            voters.sort_by_key(|peer| peer.id);
+            voters.dedup_by_key(|peer| peer.id);
+            Membership {
+                voters,
+                learners: Vec::new(),
+            }
+        };
 
-        let mut inner = Inner::new(config.id, config.peers, config.data_dir);
+        let mut inner = Inner::new(config.id, bootstrap, config.data_dir);
         inner.load();
-        if inner.peers.len() == 1 {
+        if inner.is_voter() && inner.membership.voters.len() == 1 {
             inner.current_term = inner.current_term.saturating_add(1).max(1);
             inner.voted_for = Some(inner.id);
             inner.become_leader();
@@ -128,7 +167,8 @@ impl Node {
 
         tracing::info!(
             node = inner.id,
-            members = inner.peers.len(),
+            voters = ?Membership::ids(&inner.membership.voters),
+            learners = ?Membership::ids(&inner.membership.learners),
             term = inner.current_term,
             role = ?inner.role,
             "raft started"
@@ -136,7 +176,7 @@ impl Node {
         let node = Arc::new(Self {
             id: inner.id,
             inner: Mutex::new(inner),
-            peer_locks,
+            peer_locks: std::sync::Mutex::new(HashMap::new()),
             running: AtomicBool::new(true),
         });
         let ticker = Arc::clone(&node);
@@ -171,19 +211,151 @@ impl Node {
                     leader: inner.leader_addr(),
                 });
             }
-            let term = inner.current_term;
-            let node = inner.id;
-            let (op, key) = command_fields(&command);
-            let key = key.to_string();
-            inner.log.push(Entry { term, command });
-            let index = inner.last_index();
-            tracing::debug!(node, term, index, op, key, "proposed");
-            let (tx, rx) = oneshot::channel();
-            inner.waiters.insert(index, tx);
-            inner.persist();
-            inner.advance_commit();
-            (index, rx)
+            inner.append(command)
         };
+        self.await_commit(index, rx).await
+    }
+
+    /// Local view of the membership; not linearizable.
+    pub(crate) async fn membership(&self) -> Value {
+        let inner = self.inner.lock().await;
+        json!({
+            "id": inner.id,
+            "leader": inner.leader_id,
+            "voters": peers_json(&inner.membership.voters),
+            "learners": peers_json(&inner.membership.learners),
+            "config_index": inner.config_index,
+            "committed": inner.config_index <= inner.commit_index,
+        })
+    }
+
+    /// Add `peer` as a learner, wait for it to catch up, then promote it to a
+    /// voter. Safe to retry: each step is skipped if it already happened.
+    pub(crate) async fn add_member(self: &Arc<Self>, peer: Peer) -> Result<Value, RaftError> {
+        self.change_membership(|current| {
+            if let Some(existing) = current.find(peer.id) {
+                if existing.addr != peer.addr {
+                    return Err(RaftError::Rejected(format!(
+                        "member {} already exists at {}",
+                        peer.id, existing.addr
+                    )));
+                }
+                return Ok(None);
+            }
+            if let Some(other) = current
+                .voters
+                .iter()
+                .chain(&current.learners)
+                .find(|other| other.addr == peer.addr)
+            {
+                return Err(RaftError::Rejected(format!(
+                    "address {} already belongs to member {}",
+                    peer.addr, other.id
+                )));
+            }
+            let mut next = current.clone();
+            next.learners.push(peer.clone());
+            next.learners.sort_by_key(|peer| peer.id);
+            Ok(Some(next))
+        })
+        .await?;
+
+        self.wait_caught_up(peer.id).await?;
+
+        self.change_membership(|current| {
+            if current.is_voter(peer.id) {
+                return Ok(None);
+            }
+            if !current.is_learner(peer.id) {
+                return Err(RaftError::Rejected(format!(
+                    "member {} left the configuration during catch-up",
+                    peer.id
+                )));
+            }
+            let mut next = current.clone();
+            next.learners.retain(|learner| learner.id != peer.id);
+            next.voters.push(peer.clone());
+            next.voters.sort_by_key(|peer| peer.id);
+            Ok(Some(next))
+        })
+        .await?;
+
+        Ok(self.membership().await)
+    }
+
+    /// Append a new configuration computed by `change` and wait for it to
+    /// commit. `change` returns `None` when the membership already matches.
+    async fn change_membership(
+        self: &Arc<Self>,
+        change: impl FnOnce(&Membership) -> Result<Option<Membership>, RaftError>,
+    ) -> Result<(), RaftError> {
+        let (index, rx) = {
+            let mut inner = self.inner.lock().await;
+            if inner.role != Role::Leader {
+                return Err(RaftError::NotLeader {
+                    leader: inner.leader_addr(),
+                });
+            }
+            // One change at a time keeps every old and new majority
+            // overlapping.
+            if inner.config_index > inner.commit_index {
+                return Err(RaftError::Busy(
+                    "another membership change is still committing".into(),
+                ));
+            }
+            // A new leader may hold an uncommitted configuration from an
+            // earlier term; committing an entry of its own term first rules
+            // that out (Ongaro, raft-dev 2015).
+            if inner.log[inner.commit_index].term != inner.current_term {
+                return Err(RaftError::Busy(
+                    "leader has not committed an entry in its term yet".into(),
+                ));
+            }
+            let Some(next) = change(&inner.membership)? else {
+                return Ok(());
+            };
+            inner.append(Command::Config(next))
+        };
+        self.await_commit(index, rx).await
+    }
+
+    async fn wait_caught_up(self: &Arc<Self>, id: u64) -> Result<(), RaftError> {
+        let deadline = Instant::now() + CATCHUP_TIMEOUT;
+        loop {
+            {
+                let inner = self.inner.lock().await;
+                if inner.role != Role::Leader {
+                    return Err(RaftError::NotLeader {
+                        leader: inner.leader_addr(),
+                    });
+                }
+                let matched = inner.match_index.get(&id).copied().unwrap_or(0);
+                if matched >= inner.commit_index {
+                    tracing::info!(node = inner.id, learner = id, matched, "learner caught up");
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    tracing::warn!(
+                        node = inner.id,
+                        learner = id,
+                        matched,
+                        commit = inner.commit_index,
+                        "learner did not catch up"
+                    );
+                    return Err(RaftError::Busy(format!(
+                        "member {id} has not caught up; it remains a learner, retry to promote it"
+                    )));
+                }
+            }
+            tokio::time::sleep(TICK).await;
+        }
+    }
+
+    async fn await_commit(
+        self: &Arc<Self>,
+        index: usize,
+        rx: oneshot::Receiver<bool>,
+    ) -> Result<(), RaftError> {
         let _ = self.replicate_all().await;
         match tokio::time::timeout(PROPOSE_TIMEOUT, rx).await {
             Ok(Ok(true)) => Ok(()),
@@ -362,6 +534,7 @@ impl Node {
         }
 
         let mut dirty = false;
+        let mut membership_changed = false;
         if let Some(entries) = req.get("entries").and_then(|v| v.as_array()) {
             for (offset, raw) in entries.iter().enumerate() {
                 let index = prev_index + 1 + offset;
@@ -383,8 +556,10 @@ impl Node {
                         inner.log.truncate(index);
                         inner.log.push(entry);
                         dirty = true;
+                        membership_changed = true;
                     }
                 } else if index == inner.log.len() {
+                    membership_changed |= matches!(entry.command, Command::Config(_));
                     inner.log.push(entry);
                     dirty = true;
                 } else {
@@ -395,6 +570,9 @@ impl Node {
                     });
                 }
             }
+        }
+        if membership_changed {
+            inner.refresh_membership();
         }
 
         let leader_commit = u64_field(req, "leader_commit").unwrap_or(0) as usize;
@@ -443,7 +621,10 @@ impl Node {
                 } else {
                     Action::None
                 }
-            } else if !inner.election_in_progress && Instant::now() >= inner.election_deadline {
+            } else if inner.is_voter()
+                && !inner.election_in_progress
+                && Instant::now() >= inner.election_deadline
+            {
                 Action::Elect
             } else {
                 Action::None
@@ -462,6 +643,7 @@ impl Node {
         {
             let mut inner = self.inner.lock().await;
             if inner.role == Role::Leader
+                || !inner.is_voter()
                 || inner.election_in_progress
                 || Instant::now() < inner.election_deadline
             {
@@ -477,6 +659,7 @@ impl Node {
             inner.election_in_progress = false;
             if !self.running.load(Ordering::Relaxed)
                 || inner.role == Role::Leader
+                || !inner.is_voter()
                 || Instant::now() < inner.election_deadline
             {
                 return;
@@ -500,7 +683,7 @@ impl Node {
                 candidate_id: inner.id,
                 last_log_index: inner.last_index() as u64,
                 last_log_term: inner.last_term(),
-                peers: inner.others(),
+                peers: inner.other_voters(),
                 quorum: inner.quorum(),
             }
         };
@@ -586,7 +769,7 @@ impl Node {
             })
         };
         let term = u64_field(&vote_req, "term").unwrap_or(0);
-        let peers = self.inner.lock().await.others();
+        let peers = self.inner.lock().await.other_voters();
         for peer in peers {
             let this = Arc::clone(self);
             let req = vote_req.clone();
@@ -636,52 +819,69 @@ impl Node {
         if !self.running.load(Ordering::Relaxed) {
             return false;
         }
-        let (peers, quorum, term) = {
+        let (voters, learners, quorum, term, self_vote) = {
             let inner = self.inner.lock().await;
             if inner.role != Role::Leader {
                 return false;
             }
-            (inner.others(), inner.quorum(), inner.current_term)
+            (
+                inner.other_voters(),
+                inner.other_learners(),
+                inner.quorum(),
+                inner.current_term,
+                usize::from(inner.is_voter()),
+            )
         };
-        if peers.is_empty() {
-            let mut inner = self.inner.lock().await;
-            if inner.role == Role::Leader && inner.current_term == term {
-                inner.last_quorum_ok = Instant::now();
-                inner.advance_commit();
-                return true;
-            }
-            return false;
+
+        // Learners never count toward quorum, so their replication must not be
+        // cancelled when the voter majority answers first.
+        for peer in learners {
+            let this = Arc::clone(self);
+            tokio::spawn(async move { this.replicate_one(peer, false).await });
         }
 
         let mut pending = JoinSet::new();
-        for peer in peers {
+        for peer in voters {
             let this = Arc::clone(self);
-            pending.spawn(async move { this.replicate_one(peer).await });
+            pending.spawn(async move { this.replicate_one(peer, true).await });
         }
-        let mut ok = 1usize;
-        while let Some(joined) = pending.join_next().await {
+        let mut ok = self_vote;
+        while ok < quorum {
+            let Some(joined) = pending.join_next().await else {
+                break;
+            };
             if matches!(joined, Ok(RpcOutcome::CaughtUp)) {
                 ok += 1;
-            }
-            if ok >= quorum {
-                break;
             }
         }
         drop(pending);
         let mut inner = self.inner.lock().await;
         if inner.role == Role::Leader && inner.current_term == term && ok >= quorum {
             inner.last_quorum_ok = Instant::now();
+            inner.advance_commit();
             true
         } else {
             false
         }
     }
 
-    async fn replicate_one(self: &Arc<Self>, peer: Peer) -> RpcOutcome {
-        let Some(mutex) = self.peer_locks.get(&peer.id) else {
-            return RpcOutcome::Unreachable;
+    fn peer_lock(&self, id: u64) -> Arc<Mutex<()>> {
+        let mut locks = self.peer_locks.lock().unwrap_or_else(|err| err.into_inner());
+        Arc::clone(locks.entry(id).or_default())
+    }
+
+    /// `wait` queues behind an in-flight round to the same peer; otherwise a
+    /// busy peer is skipped so detached learner rounds cannot pile up.
+    async fn replicate_one(self: &Arc<Self>, peer: Peer, wait: bool) -> RpcOutcome {
+        let mutex = self.peer_lock(peer.id);
+        let _guard = if wait {
+            mutex.lock().await
+        } else {
+            match mutex.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return RpcOutcome::Unreachable,
+            }
         };
-        let _guard = mutex.lock().await;
         if !self.running.load(Ordering::Relaxed) {
             return RpcOutcome::Unreachable;
         }
@@ -785,12 +985,14 @@ struct Campaign {
 }
 
 impl Inner {
-    fn new(id: u64, peers: Vec<Peer>, data_dir: Option<PathBuf>) -> Self {
+    fn new(id: u64, bootstrap: Membership, data_dir: Option<PathBuf>) -> Self {
         let now = Instant::now();
         let election_timeout = random_timeout(id);
         Self {
             id,
-            peers,
+            membership: bootstrap.clone(),
+            bootstrap,
+            config_index: 0,
             role: Role::Follower,
             current_term: 0,
             voted_for: None,
@@ -823,7 +1025,71 @@ impl Inner {
     }
 
     fn quorum(&self) -> usize {
-        self.peers.len() / 2 + 1
+        self.membership.voters.len() / 2 + 1
+    }
+
+    fn is_voter(&self) -> bool {
+        self.membership.is_voter(self.id)
+    }
+
+    /// Append a log entry on the leader and register a commit waiter.
+    fn append(&mut self, command: Command) -> (usize, oneshot::Receiver<bool>) {
+        let term = self.current_term;
+        let (op, key) = command_fields(&command);
+        let key = key.to_string();
+        let is_config = matches!(command, Command::Config(_));
+        self.log.push(Entry { term, command });
+        let index = self.last_index();
+        tracing::debug!(node = self.id, term, index, op, key, "proposed");
+        if is_config {
+            self.refresh_membership();
+        }
+        let (tx, rx) = oneshot::channel();
+        self.waiters.insert(index, tx);
+        self.persist();
+        self.advance_commit();
+        (index, rx)
+    }
+
+    /// Adopt the latest configuration in the log, or the bootstrap peers if
+    /// the log has none.
+    fn refresh_membership(&mut self) {
+        let (index, membership) = self
+            .log
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, entry)| match &entry.command {
+                Command::Config(membership) => Some((index, membership.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| (0, self.bootstrap.clone()));
+        if membership != self.membership {
+            tracing::info!(
+                node = self.id,
+                index,
+                voters = ?Membership::ids(&membership.voters),
+                learners = ?Membership::ids(&membership.learners),
+                "membership changed"
+            );
+        }
+        self.membership = membership;
+        self.config_index = index;
+        if self.role == Role::Leader {
+            let next = self.last_index() + 1;
+            let targets: Vec<u64> = self
+                .other_voters()
+                .into_iter()
+                .chain(self.other_learners())
+                .map(|peer| peer.id)
+                .collect();
+            for id in &targets {
+                self.next_index.entry(*id).or_insert(next);
+                self.match_index.entry(*id).or_insert(0);
+            }
+            self.next_index.retain(|id, _| targets.contains(id));
+            self.match_index.retain(|id, _| targets.contains(id));
+        }
     }
 
     fn last_index(&self) -> usize {
@@ -834,8 +1100,18 @@ impl Inner {
         self.log[self.last_index()].term
     }
 
-    fn others(&self) -> Vec<Peer> {
-        self.peers
+    fn other_voters(&self) -> Vec<Peer> {
+        self.membership
+            .voters
+            .iter()
+            .filter(|peer| peer.id != self.id)
+            .cloned()
+            .collect()
+    }
+
+    fn other_learners(&self) -> Vec<Peer> {
+        self.membership
+            .learners
             .iter()
             .filter(|peer| peer.id != self.id)
             .cloned()
@@ -844,20 +1120,16 @@ impl Inner {
 
     fn leader_addr(&self) -> Option<String> {
         let id = self.leader_id?;
-        self.peers
-            .iter()
-            .find(|peer| peer.id == id)
-            .map(|peer| peer.addr.clone())
+        self.membership.find(id).map(|peer| peer.addr.clone())
     }
 
     fn become_leader(&mut self) {
         self.role = Role::Leader;
         self.leader_id = Some(self.id);
         let next = self.last_index() + 1;
-        for peer in &self.peers {
-            if peer.id == self.id {
-                continue;
-            }
+        self.next_index.clear();
+        self.match_index.clear();
+        for peer in self.other_voters().into_iter().chain(self.other_learners()) {
             self.next_index.insert(peer.id, next);
             self.match_index.insert(peer.id, 0);
         }
@@ -944,9 +1216,11 @@ impl Inner {
             if self.log[index].term != self.current_term {
                 continue;
             }
-            let mut replicas = 1usize;
-            for matched in self.match_index.values() {
-                if *matched >= index {
+            let mut replicas = usize::from(self.is_voter());
+            for voter in &self.membership.voters {
+                if voter.id != self.id
+                    && self.match_index.get(&voter.id).is_some_and(|m| *m >= index)
+                {
                     replicas += 1;
                 }
             }
@@ -982,6 +1256,9 @@ impl Inner {
                 }
                 Command::Noop => {
                     tracing::debug!(node = self.id, index, "applied noop");
+                }
+                Command::Config(_) => {
+                    tracing::debug!(node = self.id, index, "committed membership");
                 }
             }
             if let Some(waiter) = self.waiters.remove(&self.last_applied) {
@@ -1045,6 +1322,7 @@ impl Inner {
         self.current_term = u64_field(&value, "current_term").unwrap_or(0);
         self.voted_for = value.get("voted_for").and_then(|v| v.as_u64());
         self.log = log;
+        self.refresh_membership();
         let commit = u64_field(&value, "commit_index").unwrap_or(0) as usize;
         self.commit_index = commit.min(self.last_index());
         self.last_applied = 0;
@@ -1065,6 +1343,7 @@ fn command_fields(command: &Command) -> (&'static str, &str) {
         Command::Noop => ("noop", ""),
         Command::Put { key, .. } => ("put", key),
         Command::Delete { key } => ("del", key),
+        Command::Config(_) => ("config", ""),
     }
 }
 
@@ -1119,7 +1398,33 @@ fn entry_json(entry: &Entry) -> Value {
             "op": "del",
             "key": key
         }),
+        Command::Config(membership) => json!({
+            "term": entry.term,
+            "op": "config",
+            "voters": peers_json(&membership.voters),
+            "learners": peers_json(&membership.learners)
+        }),
     }
+}
+
+fn peers_json(peers: &[Peer]) -> Value {
+    peers
+        .iter()
+        .map(|peer| json!({ "id": peer.id, "addr": peer.addr }))
+        .collect()
+}
+
+fn parse_peers(value: &Value) -> Option<Vec<Peer>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|raw| {
+            Some(Peer {
+                id: u64_field(raw, "id")?,
+                addr: raw.get("addr")?.as_str()?.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn parse_entry(value: &Value) -> Option<Entry> {
@@ -1134,6 +1439,10 @@ fn parse_entry(value: &Value) -> Option<Entry> {
         "del" => Command::Delete {
             key: value.get("key")?.as_str()?.to_string(),
         },
+        "config" => Command::Config(Membership {
+            voters: parse_peers(value.get("voters")?)?,
+            learners: parse_peers(value.get("learners")?)?,
+        }),
         _ => return None,
     };
     Some(Entry { term, command })

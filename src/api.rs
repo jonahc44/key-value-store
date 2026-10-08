@@ -3,7 +3,7 @@
 //! write or confirmed it still holds a majority.
 
 use crate::net;
-use crate::raft::{Command, Node, RaftError};
+use crate::raft::{Command, Node, Peer, RaftError};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -15,11 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const FORWARD_TIMEOUT: Duration = Duration::from_millis(2200);
+/// Covers learner catch-up plus two configuration commits on the leader.
+pub(crate) const MEMBER_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn router(node: Arc<Node>) -> Router {
     Router::new()
         .route("/raft/request-vote", post(request_vote))
         .route("/raft/append-entries", post(append_entries))
+        .route("/cluster/members", get(list_members).post(add_member))
         .route("/{key}", get(get_key).put(put_key).delete(delete_key))
         .with_state(node)
 }
@@ -30,6 +33,49 @@ async fn request_vote(State(node): State<Arc<Node>>, Json(body): Json<Value>) ->
 
 async fn append_entries(State(node): State<Arc<Node>>, Json(body): Json<Value>) -> Json<Value> {
     Json(node.handle_append_entries(&body).await)
+}
+
+async fn list_members(State(node): State<Arc<Node>>) -> Json<Value> {
+    Json(node.membership().await)
+}
+
+#[tracing::instrument(skip_all, fields(node = node.id(), method = "POST", path = "/cluster/members"))]
+async fn add_member(State(node): State<Arc<Node>>, headers: HeaderMap, body: Bytes) -> Response {
+    let forwarded = headers.contains_key("x-raft-forwarded");
+    let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let id = request.get("id").and_then(|v| v.as_u64());
+    let addr = request.get("addr").and_then(|v| v.as_str());
+    let (Some(id), Some(addr)) = (id, addr.filter(|addr| !addr.is_empty())) else {
+        tracing::warn!("rejected member add; malformed body");
+        return error(
+            StatusCode::BAD_REQUEST,
+            "body must look like {\"id\": N, \"addr\": \"HOST:PORT\"}",
+        );
+    };
+    tracing::info!(member = id, %addr, "adding member");
+    match node
+        .add_member(Peer {
+            id,
+            addr: addr.to_string(),
+        })
+        .await
+    {
+        Ok(membership) => {
+            tracing::info!(status = 200, member = id, "member added");
+            (StatusCode::OK, Json(membership)).into_response()
+        }
+        Err(err) => {
+            dispatch_error(
+                &err,
+                forwarded,
+                "POST",
+                "/cluster/members",
+                Some(body.to_vec()),
+                MEMBER_TIMEOUT,
+            )
+            .await
+        }
+    }
 }
 
 #[tracing::instrument(skip_all, fields(node = node.id(), method = "GET", key = %key))]
@@ -48,7 +94,9 @@ async fn get_key(
             tracing::info!(status = 404, "client request");
             error(StatusCode::NOT_FOUND, "not found")
         }
-        Err(err) => dispatch_error(&err, forwarded, "GET", &key, None).await,
+        Err(err) => {
+            dispatch_error(&err, forwarded, "GET", &key_path(&key), None, FORWARD_TIMEOUT).await
+        }
     }
 }
 
@@ -82,7 +130,17 @@ async fn put_key(
             tracing::info!(status = 201, "client request");
             (StatusCode::CREATED, Json(value)).into_response()
         }
-        Err(err) => dispatch_error(&err, forwarded, "PUT", &key, Some(body.to_vec())).await,
+        Err(err) => {
+            dispatch_error(
+                &err,
+                forwarded,
+                "PUT",
+                &key_path(&key),
+                Some(body.to_vec()),
+                FORWARD_TIMEOUT,
+            )
+            .await
+        }
     }
 }
 
@@ -98,7 +156,10 @@ async fn delete_key(
             tracing::info!(status = 204, "client request");
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(err) => dispatch_error(&err, forwarded, "DELETE", &key, None).await,
+        Err(err) => {
+            dispatch_error(&err, forwarded, "DELETE", &key_path(&key), None, FORWARD_TIMEOUT)
+                .await
+        }
     }
 }
 
@@ -106,21 +167,14 @@ async fn dispatch_error(
     err: &RaftError,
     forwarded: bool,
     method: &str,
-    key: &str,
+    path: &str,
     body: Option<Vec<u8>>,
+    timeout: Duration,
 ) -> Response {
     match err {
         RaftError::NotLeader { leader: Some(addr) } if !forwarded => {
             tracing::debug!(leader = %addr, "forwarding client request");
-            match net::forward(
-                addr,
-                method,
-                &format!("/{}", encode_key(key)),
-                body,
-                FORWARD_TIMEOUT,
-            )
-            .await
-            {
+            match net::forward(addr, method, path, body, timeout).await {
                 Ok((status, response)) => {
                     tracing::info!(status, leader = %addr, "forwarded client request");
                     passthrough(status, response)
@@ -138,6 +192,14 @@ async fn dispatch_error(
         RaftError::NotLeader { .. } | RaftError::Unavailable => {
             tracing::warn!("client request failed; quorum unavailable");
             error(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+        }
+        RaftError::Busy(message) => {
+            tracing::warn!(reason = %message, "client request deferred");
+            error(StatusCode::SERVICE_UNAVAILABLE, message)
+        }
+        RaftError::Rejected(message) => {
+            tracing::warn!(reason = %message, "client request rejected");
+            error(StatusCode::CONFLICT, message)
         }
     }
 }
@@ -157,6 +219,10 @@ fn passthrough(status: u16, body: Vec<u8>) -> Response {
     builder
         .body(Body::from(body))
         .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "bad response").into_response())
+}
+
+fn key_path(key: &str) -> String {
+    format!("/{}", encode_key(key))
 }
 
 fn encode_key(key: &str) -> String {
