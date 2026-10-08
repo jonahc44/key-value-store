@@ -5,6 +5,7 @@
 mod api;
 mod net;
 mod raft;
+mod telemetry;
 
 use raft::{Config, Node};
 use serde_json::json;
@@ -455,5 +456,76 @@ mod tests {
         assert_eq!(status, 503);
 
         nodes.pop().unwrap().stop().await;
+    }
+
+    #[tokio::test]
+    async fn dropped_peer_is_recorded() {
+        let dir = std::env::temp_dir().join(format!(
+            "kv-telemetry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut nodes = cluster(3, Some(dir.clone())).await;
+        let leader = wait_leader(&nodes).await;
+        assert_eq!(put(&nodes[leader].addr, "k", json!({"v": 1})).await.0, 201);
+
+        let follower = (leader + 1) % nodes.len();
+        let lost_id = nodes[follower].node.id();
+        nodes.remove(follower).stop().await;
+        let leader = wait_leader(&nodes).await;
+        let leader_node = &nodes[leader].node;
+
+        let start = Instant::now();
+        let dropped = loop {
+            let events = leader_node.telemetry().recent_events();
+            let found = events.as_array().unwrap().iter().any(|event| {
+                event["event"] == "peer_down" && event["peer"].as_u64() == Some(lost_id)
+            });
+            if found || start.elapsed() > Duration::from_secs(5) {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(dropped, "leader never reported node {lost_id} down");
+
+        let (status, body) = call(&nodes[leader].addr, "GET", "/cluster/metrics", None)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        let text = String::from_utf8(body).unwrap();
+        assert!(
+            text.contains(&format!("raft_peer_up{{peer=\"{lost_id}\"}} 0")),
+            "{text}"
+        );
+        assert!(text.contains(&format!("raft_peer_dropouts_total{{peer=\"{lost_id}\"}} 1")));
+        assert!(text.contains("kv_requests_total{op=\"put\",code=\"201\"} 1"));
+        assert!(text.contains("raft_role{role=\"leader\"} 1"));
+
+        let leader_id = leader_node.id();
+        for node in nodes {
+            node.stop().await;
+        }
+        let journal =
+            std::fs::read_to_string(dir.join(format!("{leader_id}.events.jsonl"))).unwrap();
+        let kinds: Vec<String> = journal
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .map(|event| event["event"].as_str().unwrap().to_string())
+            .collect();
+        for expected in [
+            "node_started",
+            "leader_changed",
+            "peer_down",
+            "node_stopped",
+        ] {
+            assert!(
+                kinds.iter().any(|k| k == expected),
+                "{expected} missing: {kinds:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

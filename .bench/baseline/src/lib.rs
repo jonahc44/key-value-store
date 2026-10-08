@@ -1,0 +1,459 @@
+//! Distributed key-value store. A Raft group keeps the key space consistent
+//! and partition tolerant: a write or linearizable read is acknowledged only
+//! after a majority has accepted the leader. Members can be added at runtime.
+
+mod api;
+mod net;
+mod raft;
+
+use raft::{Config, Node};
+use serde_json::json;
+use std::sync::Arc;
+use std::time::Duration;
+
+pub use raft::{Config as ServerConfig, Peer};
+
+const JOIN_RETRY: Duration = Duration::from_millis(500);
+
+pub async fn serve(config: Config) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(&config.listen).await?;
+    let addr = listener.local_addr()?;
+    let members = if config.peers.is_empty() {
+        1
+    } else {
+        config.peers.len()
+    };
+    let node_id = config.id;
+    tracing::info!(node = node_id, %addr, members, "listening");
+    let join = config
+        .join
+        .clone()
+        .map(|seed| (seed, config.listen.clone()));
+    let node = Node::start(config);
+    let app = api::router(Arc::clone(&node));
+    if let Some((seed, advertise)) = join {
+        tokio::spawn(async move {
+            if let Err(err) = join_cluster(&seed, node_id, &advertise).await {
+                tracing::error!(node = node_id, %seed, %err, "join rejected");
+            }
+        });
+    }
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            node.shutdown();
+            tracing::info!(node = node_id, "server stopped");
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!(node = node_id, "shutting down");
+            node.shutdown();
+        }
+    }
+    Ok(())
+}
+
+/// Ask `seed` (any member) to add this node, retrying until the cluster
+/// accepts it. Returns an error only if the cluster refuses the request.
+async fn join_cluster(seed: &str, id: u64, addr: &str) -> Result<(), String> {
+    let body = json!({ "id": id, "addr": addr });
+    loop {
+        match net::post(seed, "/cluster/members", &body, api::MEMBER_TIMEOUT).await {
+            Ok((200, _)) => {
+                tracing::info!(node = id, %seed, "joined cluster");
+                return Ok(());
+            }
+            Ok((status, response)) if (400..500).contains(&status) => {
+                return Err(String::from_utf8_lossy(&response).into_owned());
+            }
+            Ok((status, response)) => {
+                let reason = String::from_utf8_lossy(&response);
+                tracing::warn!(node = id, %seed, status, %reason, "join deferred; retrying");
+            }
+            Err(err) => {
+                tracing::warn!(node = id, %seed, %err, "join request failed; retrying");
+            }
+        }
+        tokio::time::sleep(JOIN_RETRY).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Peer;
+    use crate::api;
+    use crate::net::call;
+    use crate::raft::{Config, Node};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    struct Running {
+        node: Arc<Node>,
+        addr: String,
+        server: JoinHandle<()>,
+    }
+
+    impl Running {
+        async fn stop(self) {
+            self.node.shutdown();
+            self.server.abort();
+            let _ = self.server.await;
+        }
+    }
+
+    fn launch(listener: TcpListener, config: Config) -> Running {
+        let addr = config.listen.clone();
+        let node = Node::start(config);
+        let app = api::router(Arc::clone(&node));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Running { node, addr, server }
+    }
+
+    async fn cluster(size: u64, data_dir: Option<std::path::PathBuf>) -> Vec<Running> {
+        let mut listeners = Vec::new();
+        let mut peers = Vec::new();
+        for id in 1..=size {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            peers.push(Peer { id, addr });
+            listeners.push(listener);
+        }
+        let mut running = Vec::new();
+        for (id, listener) in (1..=size).zip(listeners) {
+            let addr = peers[(id - 1) as usize].addr.clone();
+            running.push(launch(
+                listener,
+                Config {
+                    id,
+                    listen: addr,
+                    peers: peers.clone(),
+                    data_dir: data_dir.clone(),
+                    join: None,
+                },
+            ));
+        }
+        running
+    }
+
+    /// Start a node in join mode and ask `seed` to admit it.
+    async fn join(id: u64, seed: &str) -> Running {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let running = launch(
+            listener,
+            Config {
+                id,
+                listen: addr.clone(),
+                peers: Vec::new(),
+                data_dir: None,
+                join: Some(seed.to_string()),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !running.node.is_leader().await,
+            "a joining node must not elect itself"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            super::join_cluster(seed, id, &addr),
+        )
+        .await
+        .expect("join timed out")
+        .expect("join rejected");
+        running
+    }
+
+    async fn voters(node: &Node) -> Vec<u64> {
+        node.membership().await["voters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|peer| peer["id"].as_u64().unwrap())
+            .collect()
+    }
+
+    async fn wait_local(node: &Node, key: &str, value: &serde_json::Value) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            if node.local_get(key).await.as_ref() == Some(value) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{key} never reached node {}", node.id());
+    }
+
+    async fn wait_leader(nodes: &[Running]) -> usize {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(8) {
+            for (index, node) in nodes.iter().enumerate() {
+                if node.node.is_leader().await {
+                    return index;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no leader elected");
+    }
+
+    async fn exchange(
+        addr: &str,
+        method: &str,
+        key: &str,
+        body: Option<Vec<u8>>,
+    ) -> (u16, serde_json::Value) {
+        let path = format!("/{key}");
+        let mut last = String::from("no attempt");
+        for _ in 0..50 {
+            match call(addr, method, &path, body.clone()).await {
+                Ok((status, bytes)) => {
+                    let parsed = if bytes.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+                    };
+                    return (status, parsed);
+                }
+                Err(err)
+                    if err.contains("refused")
+                        || err.contains("reset")
+                        || err.contains("closed")
+                        || err.contains("Connection") =>
+                {
+                    last = err;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(err) => panic!("request failed: {err}"),
+            }
+        }
+        panic!("request failed: {last}");
+    }
+
+    async fn put(addr: &str, key: &str, value: serde_json::Value) -> (u16, serde_json::Value) {
+        let body = serde_json::to_vec(&value).unwrap();
+        exchange(addr, "PUT", key, Some(body)).await
+    }
+
+    async fn get(addr: &str, key: &str) -> (u16, serde_json::Value) {
+        exchange(addr, "GET", key, None).await
+    }
+
+    async fn delete(addr: &str, key: &str) -> u16 {
+        exchange(addr, "DELETE", key, None).await.0
+    }
+
+    #[tokio::test]
+    async fn single_node_put_get_delete() {
+        let mut nodes = cluster(1, None).await;
+        let addr = nodes[0].addr.clone();
+        let missing = get(&addr, "alpha").await;
+        assert_eq!(missing.0, 404);
+
+        let created = put(&addr, "alpha", json!({"n": 1})).await;
+        assert_eq!(created.0, 201);
+        assert_eq!(created.1, json!({"n": 1}));
+
+        let found = get(&addr, "alpha").await;
+        assert_eq!(found.0, 200);
+        assert_eq!(found.1, json!({"n": 1}));
+
+        let rejected = put(&addr, "alpha", json!([1, 2, 3])).await;
+        assert_eq!(rejected.0, 400);
+
+        assert_eq!(delete(&addr, "alpha").await, 204);
+        assert_eq!(get(&addr, "alpha").await.0, 404);
+        assert_eq!(delete(&addr, "alpha").await, 204);
+
+        nodes.pop().unwrap().stop().await;
+    }
+
+    #[tokio::test]
+    async fn cluster_replicates_and_forwards() {
+        let nodes = cluster(3, None).await;
+        let leader = wait_leader(&nodes).await;
+        let follower = (leader + 1) % nodes.len();
+
+        let created = put(&nodes[follower].addr, "widget", json!({"color": "red"})).await;
+        assert_eq!(created.0, 201, "{created:?}");
+
+        for node in &nodes {
+            let (status, body) = get(&node.addr, "widget").await;
+            assert_eq!(status, 200);
+            assert_eq!(body, json!({"color": "red"}));
+        }
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            let mut stored = 0;
+            for node in &nodes {
+                if node.node.local_get("widget").await == Some(json!({"color": "red"})) {
+                    stored += 1;
+                }
+            }
+            if stored >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let mut stored = 0;
+        for node in &nodes {
+            if node.node.local_get("widget").await == Some(json!({"color": "red"})) {
+                stored += 1;
+            }
+        }
+        assert!(stored >= 2, "committed value reached {stored} members");
+
+        assert_eq!(delete(&nodes[leader].addr, "widget").await, 204);
+        for node in &nodes {
+            assert_eq!(get(&node.addr, "widget").await.0, 404);
+        }
+
+        for node in nodes {
+            node.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn minority_cannot_commit_and_survivor_can() {
+        let mut nodes = cluster(3, None).await;
+        let leader = wait_leader(&nodes).await;
+        assert_eq!(
+            put(&nodes[leader].addr, "before", json!({"ok": true}))
+                .await
+                .0,
+            201
+        );
+
+        let lost = nodes.remove(leader);
+        lost.stop().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let next = wait_leader(&nodes).await;
+        let created = put(&nodes[next].addr, "after", json!({"ok": true})).await;
+        assert_eq!(created.0, 201, "{created:?}");
+        assert_eq!(
+            get(&nodes[(next + 1) % nodes.len()].addr, "before").await.0,
+            200
+        );
+        assert_eq!(get(&nodes[next].addr, "after").await.1, json!({"ok": true}));
+
+        let isolated = nodes.remove(next);
+        for extra in nodes {
+            extra.stop().await;
+        }
+        let (status, _) = put(&isolated.addr, "split", json!({"ok": false})).await;
+        assert_eq!(status, 503);
+        let (status, _) = get(&isolated.addr, "after").await;
+        assert_eq!(status, 503);
+        isolated.stop().await;
+    }
+
+    #[tokio::test]
+    async fn data_dir_survives_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "kv-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nodes = cluster(1, Some(dir.clone())).await;
+        let addr = nodes[0].addr.clone();
+        assert_eq!(put(&addr, "saved", json!({"v": 7})).await.0, 201);
+        nodes.into_iter().next().unwrap().stop().await;
+
+        let nodes = cluster(1, Some(dir.clone())).await;
+        let (status, body) = get(&nodes[0].addr, "saved").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"v": 7}));
+        nodes.into_iter().next().unwrap().stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn node_added_at_runtime_becomes_voter() {
+        let mut nodes = cluster(3, None).await;
+        let leader = wait_leader(&nodes).await;
+        assert_eq!(put(&nodes[leader].addr, "early", json!({"v": 1})).await.0, 201);
+
+        // Go through a follower so the request is forwarded to the leader.
+        let seed = nodes[(leader + 1) % nodes.len()].addr.clone();
+        let joiner = join(4, &seed).await;
+        wait_local(&joiner.node, "early", &json!({"v": 1})).await;
+        assert_eq!(voters(&nodes[leader].node).await, vec![1, 2, 3, 4]);
+
+        nodes.push(joiner);
+        let lost = nodes.remove(leader);
+        lost.stop().await;
+
+        // Three of four voters remain, so a write needs the new member's ack.
+        let next = wait_leader(&nodes).await;
+        let created = put(&nodes[next].addr, "late", json!({"v": 2})).await;
+        assert_eq!(created.0, 201, "{created:?}");
+        let joiner = nodes.iter().find(|n| n.node.id() == 4).unwrap();
+        wait_local(&joiner.node, "late", &json!({"v": 2})).await;
+
+        // Two of four is not a majority.
+        let original = nodes.iter().position(|n| n.node.id() != 4).unwrap();
+        nodes.remove(original).stop().await;
+        let survivor = nodes[0].addr.clone();
+        let (status, _) = put(&survivor, "split", json!({"v": 3})).await;
+        assert_eq!(status, 503);
+
+        for node in nodes {
+            node.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn write_through_node_right_after_join() {
+        let mut nodes = cluster(3, None).await;
+        let leader = wait_leader(&nodes).await;
+        let seed = nodes[(leader + 1) % nodes.len()].addr.clone();
+
+        let joiner = join(4, &seed).await;
+        let created = put(&joiner.addr, "fresh", json!({"from": 4})).await;
+        assert_eq!(created.0, 201, "{created:?}");
+
+        nodes.push(joiner);
+        for node in &nodes {
+            let (status, body) = get(&node.addr, "fresh").await;
+            assert_eq!(status, 200, "node {}", node.node.id());
+            assert_eq!(body, json!({"from": 4}));
+        }
+
+        for node in nodes {
+            node.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn single_node_grows_and_rejects_conflicts() {
+        let mut nodes = cluster(1, None).await;
+        let seed = nodes[0].addr.clone();
+        assert_eq!(put(&seed, "a", json!({"v": 1})).await.0, 201);
+
+        let joiner = join(2, &seed).await;
+        wait_local(&joiner.node, "a", &json!({"v": 1})).await;
+        assert_eq!(voters(&nodes[0].node).await, vec![1, 2]);
+        assert_eq!(voters(&joiner.node).await, vec![1, 2]);
+
+        // Repeating the same join is a no-op; reusing the id elsewhere is not.
+        super::join_cluster(&seed, 2, &joiner.addr).await.unwrap();
+        let conflict = super::join_cluster(&seed, 2, "127.0.0.1:1").await;
+        assert!(conflict.unwrap_err().contains("already exists"));
+
+        // With two voters, losing the new one means no majority.
+        joiner.stop().await;
+        let (status, _) = put(&seed, "b", json!({"v": 2})).await;
+        assert_eq!(status, 503);
+
+        nodes.pop().unwrap().stop().await;
+    }
+}

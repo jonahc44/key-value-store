@@ -115,6 +115,11 @@ fn usage() -> &'static str {
      \n\
      GET    /cluster/members   this member's view of voters and learners\n\
      POST   /cluster/members   {\"id\": N, \"addr\": \"HOST:PORT\"} adds a member\n\
+     GET    /cluster/metrics   Prometheus metrics for this member and its peers\n\
+     GET    /cluster/events    recent events: peers dropping out, elections, ...\n\
+     \n\
+     With --data-dir, events and a stats snapshot every minute are also\n\
+     appended to DATA_DIR/ID.events.jsonl for analysis over time.\n\
      \n\
      Followers forward to the leader. A member that cannot reach a majority\n\
      returns 503, so a partition does not create two successful writers.\n\

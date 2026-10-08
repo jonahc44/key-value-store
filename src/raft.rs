@@ -12,6 +12,7 @@
 //! receives the log without voting, and is promoted once it has caught up.
 
 use crate::net;
+use crate::telemetry::{Gauges, Telemetry};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,6 +26,7 @@ const HEARTBEAT: Duration = Duration::from_millis(40);
 const TICK: Duration = Duration::from_millis(20);
 const PROPOSE_TIMEOUT: Duration = Duration::from_millis(1500);
 const CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
+const STATS_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
@@ -128,10 +130,12 @@ struct Inner {
     last_quorum_ok: Instant,
     data_dir: Option<PathBuf>,
     votes: usize,
+    telemetry: Arc<Telemetry>,
 }
 
 pub struct Node {
     id: u64,
+    telemetry: Arc<Telemetry>,
     inner: Mutex<Inner>,
     peer_locks: std::sync::Mutex<HashMap<u64, Arc<Mutex<()>>>>,
     running: AtomicBool,
@@ -157,8 +161,26 @@ impl Node {
             }
         };
 
-        let mut inner = Inner::new(config.id, bootstrap, config.data_dir);
+        let telemetry = Arc::new(Telemetry::new(config.id, config.data_dir.as_ref()));
+        let mut inner = Inner::new(
+            config.id,
+            bootstrap,
+            config.data_dir,
+            Arc::clone(&telemetry),
+        );
         inner.load();
+        telemetry.event(
+            "node_started",
+            json!({
+                "addr": config.listen,
+                "joining": config.join.is_some(),
+                "term": inner.current_term,
+                "commit_index": inner.commit_index,
+                "log_entries": inner.last_index(),
+                "voters": Membership::ids(&inner.membership.voters),
+                "learners": Membership::ids(&inner.membership.learners),
+            }),
+        );
         if inner.is_voter() && inner.membership.voters.len() == 1 {
             inner.current_term = inner.current_term.saturating_add(1).max(1);
             inner.voted_for = Some(inner.id);
@@ -175,12 +197,14 @@ impl Node {
         );
         let node = Arc::new(Self {
             id: inner.id,
+            telemetry,
             inner: Mutex::new(inner),
             peer_locks: std::sync::Mutex::new(HashMap::new()),
             running: AtomicBool::new(true),
         });
         let ticker = Arc::clone(&node);
         tokio::spawn(async move { ticker.tick_loop().await });
+        tokio::spawn(Self::stats_loop(Arc::downgrade(&node)));
         node
     }
 
@@ -188,9 +212,40 @@ impl Node {
         self.id
     }
 
+    pub(crate) fn telemetry(&self) -> &Telemetry {
+        &self.telemetry
+    }
+
     pub(crate) fn shutdown(&self) {
         tracing::debug!(node = self.id, "stopping raft ticker");
-        self.running.store(false, Ordering::Relaxed);
+        if self.running.swap(false, Ordering::Relaxed) {
+            self.telemetry.event("node_stopped", json!({}));
+            self.telemetry.flush();
+        }
+    }
+
+    /// Prometheus exposition of this member's metrics.
+    pub(crate) async fn metrics_text(&self) -> String {
+        let gauges = self.inner.lock().await.gauges();
+        self.telemetry.render(&gauges)
+    }
+
+    async fn stats_loop(node: std::sync::Weak<Self>) {
+        let mut interval = tokio::time::interval(STATS_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Some(node) = node.upgrade() else {
+                break;
+            };
+            if !node.running.load(Ordering::Relaxed) {
+                break;
+            }
+            let gauges = node.inner.lock().await.gauges();
+            node.telemetry
+                .event("stats", node.telemetry.snapshot(&gauges));
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -356,18 +411,25 @@ impl Node {
         index: usize,
         rx: oneshot::Receiver<bool>,
     ) -> Result<(), RaftError> {
+        let started = Instant::now();
+        self.telemetry.proposals.inc();
         let _ = self.replicate_all().await;
         match tokio::time::timeout(PROPOSE_TIMEOUT, rx).await {
-            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(true)) => {
+                self.telemetry.commit_latency.observe(started.elapsed());
+                Ok(())
+            }
             _ => {
                 let mut inner = self.inner.lock().await;
                 inner.waiters.remove(&index);
                 if inner.role != Role::Leader {
+                    self.telemetry.proposals_lost_leadership.inc();
                     tracing::warn!(node = inner.id, index, "proposal lost leadership");
                     Err(RaftError::NotLeader {
                         leader: inner.leader_addr(),
                     })
                 } else {
+                    self.telemetry.proposal_timeouts.inc();
                     tracing::warn!(
                         node = inner.id,
                         index,
@@ -399,6 +461,7 @@ impl Node {
             });
         }
         if !quorum_ok {
+            self.telemetry.read_quorum_failures.inc();
             tracing::warn!(node = inner.id, term, "linearizable read failed; no quorum");
             return Err(RaftError::Unavailable);
         }
@@ -496,7 +559,9 @@ impl Node {
             inner.role = Role::Follower;
             inner.fail_uncommitted();
         }
-        inner.leader_id = Some(leader_id);
+        if inner.leader_id != Some(leader_id) {
+            inner.note_leader(leader_id);
+        }
         inner.refresh_follower_timer();
 
         let prev = u64_field(req, "prev_log_index").unwrap_or(0);
@@ -547,11 +612,17 @@ impl Node {
                 };
                 if index < inner.log.len() {
                     if inner.log[index].term != entry.term {
+                        let dropped = inner.log.len().saturating_sub(index);
                         tracing::info!(
                             node = inner.id,
                             index,
-                            kept = inner.log.len().saturating_sub(index),
+                            kept = dropped,
                             "truncated conflicting log suffix"
+                        );
+                        inner.telemetry.log_truncations.inc();
+                        inner.telemetry.event(
+                            "log_truncated",
+                            json!({ "index": index, "dropped": dropped, "leader": leader_id }),
                         );
                         inner.log.truncate(index);
                         inner.log.push(entry);
@@ -672,6 +743,15 @@ impl Node {
                 term = inner.current_term + 1,
                 "starting election"
             );
+            inner.telemetry.elections_started.inc();
+            inner.telemetry.event(
+                "election_started",
+                json!({
+                    "term": inner.current_term + 1,
+                    "last_leader": inner.leader_id,
+                    "since_leader_contact_ms": inner.last_leader_contact.elapsed().as_millis(),
+                }),
+            );
             if inner.quorum() <= 1 {
                 inner.current_term = inner.current_term.saturating_add(1).max(1);
                 inner.voted_for = Some(inner.id);
@@ -700,8 +780,8 @@ impl Node {
                 "last_log_term": campaign.last_log_term,
                 "prevote": true,
             });
-            pending
-                .spawn(async move { net::post_json(&peer.addr, "/raft/request-vote", &req).await });
+            let this = Arc::clone(self);
+            pending.spawn(async move { this.peer_rpc(&peer, "/raft/request-vote", &req).await });
         }
         let mut answered = 0usize;
         while let Some(joined) = pending.join_next().await {
@@ -731,6 +811,7 @@ impl Node {
             return;
         }
         if grants < campaign.quorum {
+            self.telemetry.prevotes_failed.inc();
             tracing::debug!(
                 node = campaign.candidate_id,
                 grants,
@@ -774,7 +855,7 @@ impl Node {
             let this = Arc::clone(self);
             let req = vote_req.clone();
             tokio::spawn(async move {
-                if let Ok(response) = net::post_json(&peer.addr, "/raft/request-vote", &req).await {
+                if let Ok(response) = this.peer_rpc(&peer, "/raft/request-vote", &req).await {
                     this.on_vote(term, response).await;
                 }
             });
@@ -865,6 +946,14 @@ impl Node {
         }
     }
 
+    async fn peer_rpc(&self, peer: &Peer, path: &str, request: &Value) -> Result<Value, String> {
+        let started = Instant::now();
+        let result = net::post_json(&peer.addr, path, request).await;
+        self.telemetry
+            .record_peer_rpc(peer.id, &peer.addr, started.elapsed(), &result);
+        result
+    }
+
     fn peer_lock(&self, id: u64) -> Arc<Mutex<()>> {
         let mut locks = self.peer_locks.lock().unwrap_or_else(|err| err.into_inner());
         Arc::clone(locks.entry(id).or_default())
@@ -916,8 +1005,7 @@ impl Node {
                 (term, request, last)
             };
 
-            let response = match net::post_json(&peer.addr, "/raft/append-entries", &request).await
-            {
+            let response = match self.peer_rpc(&peer, "/raft/append-entries", &request).await {
                 Ok(response) => response,
                 Err(_) => return RpcOutcome::Unreachable,
             };
@@ -985,7 +1073,12 @@ struct Campaign {
 }
 
 impl Inner {
-    fn new(id: u64, bootstrap: Membership, data_dir: Option<PathBuf>) -> Self {
+    fn new(
+        id: u64,
+        bootstrap: Membership,
+        data_dir: Option<PathBuf>,
+        telemetry: Arc<Telemetry>,
+    ) -> Self {
         let now = Instant::now();
         let election_timeout = random_timeout(id);
         Self {
@@ -1015,7 +1108,45 @@ impl Inner {
             last_quorum_ok: now,
             data_dir,
             votes: 0,
+            telemetry,
         }
+    }
+
+    fn gauges(&self) -> Gauges {
+        let mut peer_match: Vec<(u64, usize)> = if self.role == Role::Leader {
+            self.match_index
+                .iter()
+                .map(|(id, matched)| (*id, *matched))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        peer_match.sort_unstable();
+        Gauges {
+            role: match self.role {
+                Role::Follower => "follower",
+                Role::Candidate => "candidate",
+                Role::Leader => "leader",
+            },
+            term: self.current_term,
+            leader: self.leader_id,
+            commit_index: self.commit_index,
+            applied_index: self.last_applied,
+            last_index: self.last_index(),
+            voters: self.membership.voters.len(),
+            learners: self.membership.learners.len(),
+            keys: self.data.len(),
+            peer_match,
+        }
+    }
+
+    fn note_leader(&mut self, leader: u64) {
+        self.leader_id = Some(leader);
+        self.telemetry.leader_changes.inc();
+        self.telemetry.event(
+            "leader_changed",
+            json!({ "leader": leader, "term": self.current_term }),
+        );
     }
 
     fn refresh_follower_timer(&mut self) {
@@ -1072,6 +1203,14 @@ impl Inner {
                 learners = ?Membership::ids(&membership.learners),
                 "membership changed"
             );
+            self.telemetry.event(
+                "membership_changed",
+                json!({
+                    "index": index,
+                    "voters": Membership::ids(&membership.voters),
+                    "learners": Membership::ids(&membership.learners),
+                }),
+            );
         }
         self.membership = membership;
         self.config_index = index;
@@ -1125,7 +1264,8 @@ impl Inner {
 
     fn become_leader(&mut self) {
         self.role = Role::Leader;
-        self.leader_id = Some(self.id);
+        self.telemetry.elections_won.inc();
+        self.note_leader(self.id);
         let next = self.last_index() + 1;
         self.next_index.clear();
         self.match_index.clear();
@@ -1148,6 +1288,17 @@ impl Inner {
     fn step_down(&mut self) {
         if self.role == Role::Follower {
             return;
+        }
+        if self.role == Role::Leader {
+            self.telemetry.step_downs.inc();
+            self.telemetry.event(
+                "stepped_down",
+                json!({
+                    "term": self.current_term,
+                    "reason": "lost_quorum",
+                    "quorum_silence_ms": self.last_quorum_ok.elapsed().as_millis(),
+                }),
+            );
         }
         self.role = Role::Follower;
         self.leader_id = None;
@@ -1172,6 +1323,14 @@ impl Inner {
             to = term,
             "observed higher term"
         );
+        self.telemetry.term_changes.inc();
+        if self.role == Role::Leader {
+            self.telemetry.step_downs.inc();
+            self.telemetry.event(
+                "stepped_down",
+                json!({ "term": self.current_term, "reason": "higher_term", "new_term": term }),
+            );
+        }
         self.current_term = term;
         self.voted_for = None;
         self.role = Role::Follower;
@@ -1268,12 +1427,22 @@ impl Inner {
     }
 
     fn persist(&self) {
-        let Some(dir) = &self.data_dir else {
+        if self.data_dir.is_none() {
             return;
+        }
+        let started = Instant::now();
+        let result = self.write_state();
+        self.telemetry
+            .record_persist(started.elapsed(), result.is_ok(), result.err().as_deref());
+    }
+
+    fn write_state(&self) -> Result<(), String> {
+        let Some(dir) = &self.data_dir else {
+            return Ok(());
         };
         if let Err(err) = std::fs::create_dir_all(dir) {
             tracing::error!(node = self.id, path = %dir.display(), %err, "failed to create data dir");
-            return;
+            return Err(err.to_string());
         }
         let path = dir.join(format!("{}.json", self.id));
         let tmp = dir.join(format!("{}.json.tmp", self.id));
@@ -1287,11 +1456,13 @@ impl Inner {
         let bytes = serde_json::to_vec(&body).unwrap_or_default();
         if let Err(err) = std::fs::write(&tmp, &bytes) {
             tracing::error!(node = self.id, path = %tmp.display(), %err, "failed to write raft state");
-            return;
+            return Err(err.to_string());
         }
         if let Err(err) = std::fs::rename(&tmp, &path) {
             tracing::error!(node = self.id, path = %path.display(), %err, "failed to replace raft state");
+            return Err(err.to_string());
         }
+        Ok(())
     }
 
     fn load(&mut self) {

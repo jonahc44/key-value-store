@@ -4,15 +4,17 @@
 
 use crate::net;
 use crate::raft::{Command, Node, Peer, RaftError};
+use crate::telemetry::ClientOp;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const FORWARD_TIMEOUT: Duration = Duration::from_millis(2200);
 /// Covers learner catch-up plus two configuration commits on the leader.
@@ -23,8 +25,40 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/raft/request-vote", post(request_vote))
         .route("/raft/append-entries", post(append_entries))
         .route("/cluster/members", get(list_members).post(add_member))
+        .route("/cluster/metrics", get(metrics))
+        .route("/cluster/events", get(events))
         .route("/{key}", get(get_key).put(put_key).delete(delete_key))
+        .layer(middleware::from_fn_with_state(Arc::clone(&node), track))
         .with_state(node)
+}
+
+/// Count and time client requests. Requests forwarded by another member are
+/// tallied separately so the cluster-wide request total is not doubled.
+async fn track(State(node): State<Arc<Node>>, request: Request, next: Next) -> Response {
+    let Some(op) = ClientOp::classify(request.method().as_str(), request.uri().path()) else {
+        return next.run(request).await;
+    };
+    if request.headers().contains_key("x-raft-forwarded") {
+        node.telemetry().forwarded_received.inc();
+        return next.run(request).await;
+    }
+    let started = Instant::now();
+    let response = next.run(request).await;
+    node.telemetry()
+        .record_request(op, response.status().as_u16(), started.elapsed());
+    response
+}
+
+async fn metrics(State(node): State<Arc<Node>>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        node.metrics_text().await,
+    )
+        .into_response()
+}
+
+async fn events(State(node): State<Arc<Node>>) -> Json<Value> {
+    Json(node.telemetry().recent_events())
 }
 
 async fn request_vote(State(node): State<Arc<Node>>, Json(body): Json<Value>) -> Json<Value> {
@@ -66,6 +100,7 @@ async fn add_member(State(node): State<Arc<Node>>, headers: HeaderMap, body: Byt
         }
         Err(err) => {
             dispatch_error(
+                &node,
                 &err,
                 forwarded,
                 "POST",
@@ -95,7 +130,16 @@ async fn get_key(
             error(StatusCode::NOT_FOUND, "not found")
         }
         Err(err) => {
-            dispatch_error(&err, forwarded, "GET", &key_path(&key), None, FORWARD_TIMEOUT).await
+            dispatch_error(
+                &node,
+                &err,
+                forwarded,
+                "GET",
+                &key_path(&key),
+                None,
+                FORWARD_TIMEOUT,
+            )
+            .await
         }
     }
 }
@@ -132,6 +176,7 @@ async fn put_key(
         }
         Err(err) => {
             dispatch_error(
+                &node,
                 &err,
                 forwarded,
                 "PUT",
@@ -157,13 +202,22 @@ async fn delete_key(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(err) => {
-            dispatch_error(&err, forwarded, "DELETE", &key_path(&key), None, FORWARD_TIMEOUT)
-                .await
+            dispatch_error(
+                &node,
+                &err,
+                forwarded,
+                "DELETE",
+                &key_path(&key),
+                None,
+                FORWARD_TIMEOUT,
+            )
+            .await
         }
     }
 }
 
 async fn dispatch_error(
+    node: &Node,
     err: &RaftError,
     forwarded: bool,
     method: &str,
@@ -176,10 +230,12 @@ async fn dispatch_error(
             tracing::debug!(leader = %addr, "forwarding client request");
             match net::forward(addr, method, path, body, timeout).await {
                 Ok((status, response)) => {
+                    node.telemetry().forwards_ok.inc();
                     tracing::info!(status, leader = %addr, "forwarded client request");
                     passthrough(status, response)
                 }
                 Err(err) => {
+                    node.telemetry().forwards_failed.inc();
                     tracing::warn!(leader = %addr, %err, "leader unreachable");
                     error(StatusCode::SERVICE_UNAVAILABLE, "leader unreachable")
                 }
