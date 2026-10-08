@@ -21,14 +21,18 @@ const FORWARD_TIMEOUT: Duration = Duration::from_millis(2200);
 pub(crate) const MEMBER_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn router(node: Arc<Node>) -> Router {
+    // Raft RPCs are most of the traffic a member serves, so they bypass the
+    // per-request middleware.
+    let client = Router::new()
+        .route("/cluster/members", get(list_members).post(add_member))
+        .route("/{key}", get(get_key).put(put_key).delete(delete_key))
+        .route_layer(middleware::from_fn_with_state(Arc::clone(&node), track));
     Router::new()
         .route("/raft/request-vote", post(request_vote))
         .route("/raft/append-entries", post(append_entries))
-        .route("/cluster/members", get(list_members).post(add_member))
         .route("/cluster/metrics", get(metrics))
         .route("/cluster/events", get(events))
-        .route("/{key}", get(get_key).put(put_key).delete(delete_key))
-        .layer(middleware::from_fn_with_state(Arc::clone(&node), track))
+        .merge(client)
         .with_state(node)
 }
 
