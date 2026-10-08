@@ -412,6 +412,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_through_node_right_after_join() {
+        let mut nodes = cluster(3, None).await;
+        let leader = wait_leader(&nodes).await;
+        let seed = nodes[(leader + 1) % nodes.len()].addr.clone();
+
+        let joiner = join(4, &seed).await;
+        let created = put(&joiner.addr, "fresh", json!({"from": 4})).await;
+        assert_eq!(created.0, 201, "{created:?}");
+
+        nodes.push(joiner);
+        for node in &nodes {
+            let (status, body) = get(&node.addr, "fresh").await;
+            assert_eq!(status, 200, "node {}", node.node.id());
+            assert_eq!(body, json!({"from": 4}));
+        }
+
+        for node in nodes {
+            node.stop().await;
+        }
+    }
+
+    #[tokio::test]
     async fn single_node_grows_and_rejects_conflicts() {
         let mut nodes = cluster(1, None).await;
         let seed = nodes[0].addr.clone();
