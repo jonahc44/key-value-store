@@ -4,6 +4,7 @@
 
 use crate::net;
 use crate::raft::Peer;
+use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{Value, json};
@@ -113,10 +114,19 @@ async fn discover(
     addrs: &[String],
 ) -> std::io::Result<Vec<Peer>> {
     let announce = tokio::net::TcpListener::from_std(listener.try_clone()?)?;
-    let app = Router::new().route(
-        "/cluster/id",
-        get(move || async move { Json(json!({ "id": id })) }),
-    );
+    // Clients may reach this member before it serves the real API. A 404
+    // would read as "no such key", so tell them to retry instead.
+    let app = Router::new()
+        .route(
+            "/cluster/id",
+            get(move || async move { Json(json!({ "id": id })) }),
+        )
+        .fallback(|| async {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "starting up" })),
+            )
+        });
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let _ = axum::serve(announce, app)
