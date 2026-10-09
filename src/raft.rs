@@ -109,6 +109,11 @@ pub(crate) enum RaftError {
 
 enum RpcOutcome {
     CaughtUp,
+    /// No round was sent: one to the same peer is already in flight.
+    Busy,
+    /// The peer answered a request sent after the round began, though its
+    /// log may still be behind.
+    Acked,
     Higher,
     Unreachable,
 }
@@ -142,6 +147,9 @@ struct Inner {
     departing: HashMap<u64, Departing>,
     last_heartbeat_sent: Instant,
     last_quorum_ok: Instant,
+    /// Per peer, when the latest request it answered in the current term was
+    /// sent. A round counts a busy peer once this passes the round's start.
+    peer_acked: HashMap<u64, Instant>,
     data_dir: Option<PathBuf>,
     votes: usize,
     telemetry: Arc<Telemetry>,
@@ -1068,17 +1076,19 @@ impl Node {
             tokio::spawn(async move { this.replicate_one(peer, false).await });
         }
 
+        let started = Instant::now();
+        let deadline = started + net::RPC_TIMEOUT;
         let mut pending = JoinSet::new();
         for peer in voters {
             let this = Arc::clone(self);
-            pending.spawn(async move { this.replicate_one(peer, false).await });
+            pending.spawn(async move { this.confirm(peer, started, deadline).await });
         }
         let mut ok = self_vote;
         while ok < quorum {
             let Some(joined) = pending.join_next().await else {
                 break;
             };
-            if matches!(joined, Ok(RpcOutcome::CaughtUp)) {
+            if matches!(joined, Ok(RpcOutcome::CaughtUp | RpcOutcome::Acked)) {
                 ok += 1;
             }
         }
@@ -1095,6 +1105,27 @@ impl Node {
             true
         } else {
             false
+        }
+    }
+
+    /// Replicate to `peer` and learn whether it answered a request sent after
+    /// `started`. A peer with a round already in flight is not sent another;
+    /// it counts once that round gets a fresh answer, or a new round is sent
+    /// as soon as it finishes, until `deadline`.
+    async fn confirm(self: &Arc<Self>, peer: Peer, started: Instant, deadline: Instant) -> RpcOutcome {
+        loop {
+            match self.replicate_one(peer.clone(), false).await {
+                RpcOutcome::Busy => {}
+                outcome => return outcome,
+            }
+            let acked = self.inner.lock().await.peer_acked.get(&peer.id).copied();
+            if acked.is_some_and(|sent| sent >= started) {
+                return RpcOutcome::Acked;
+            }
+            if Instant::now() >= deadline {
+                return RpcOutcome::Unreachable;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -1125,7 +1156,7 @@ impl Node {
         } else {
             match mutex.try_lock() {
                 Ok(guard) => guard,
-                Err(_) => return RpcOutcome::Unreachable,
+                Err(_) => return RpcOutcome::Busy,
             }
         };
         if !self.running.load(Ordering::Relaxed) {
@@ -1162,6 +1193,7 @@ impl Node {
                 (term, request, last)
             };
 
+            let sent = Instant::now();
             let response = match self.peer_rpc(&peer, "/raft/append-entries", &request).await {
                 Ok(response) => response,
                 Err(_) => return RpcOutcome::Unreachable,
@@ -1183,6 +1215,11 @@ impl Node {
             // recording its progress would bring its replication state back.
             if inner.membership.find(peer.id).is_none() && !inner.departing.contains_key(&peer.id) {
                 return RpcOutcome::Unreachable;
+            }
+            // Any answer in this term means the peer still follows this leader.
+            let acked = inner.peer_acked.entry(peer.id).or_insert(sent);
+            if sent > *acked {
+                *acked = sent;
             }
             if success {
                 let count = request
@@ -1290,6 +1327,7 @@ impl Inner {
             departing: HashMap::new(),
             last_heartbeat_sent: now,
             last_quorum_ok: now,
+            peer_acked: HashMap::new(),
             data_dir,
             votes: 0,
             telemetry,
