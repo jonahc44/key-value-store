@@ -1061,9 +1061,8 @@ impl Node {
             )
         };
 
-        // Learners and departing members never count toward quorum, so their
-        // replication must not be cancelled when the voter majority answers
-        // first.
+        // Learners and departing members never count toward quorum, so they
+        // are never waited on.
         for peer in learners {
             let this = Arc::clone(self);
             tokio::spawn(async move { this.replicate_one(peer, false).await });
@@ -1072,7 +1071,7 @@ impl Node {
         let mut pending = JoinSet::new();
         for peer in voters {
             let this = Arc::clone(self);
-            pending.spawn(async move { this.replicate_one(peer, true).await });
+            pending.spawn(async move { this.replicate_one(peer, false).await });
         }
         let mut ok = self_vote;
         while ok < quorum {
@@ -1083,7 +1082,12 @@ impl Node {
                 ok += 1;
             }
         }
-        drop(pending);
+        // Let the slower voters finish rather than cancelling them: up-to-date
+        // followers answer within a millisecond, so a follower that is catching
+        // up would otherwise be cancelled mid-RPC every round and never
+        // advance. Voter rounds skip a peer that already has one in flight, so
+        // at most one round per peer outlives this call.
+        pending.detach_all();
         let mut inner = self.inner.lock().await;
         if inner.role == Role::Leader && inner.current_term == term && ok >= quorum {
             inner.last_quorum_ok = Instant::now();
@@ -1111,7 +1115,9 @@ impl Node {
     }
 
     /// `wait` queues behind an in-flight round to the same peer; otherwise a
-    /// busy peer is skipped so detached learner rounds cannot pile up.
+    /// busy peer is skipped so detached rounds cannot pile up behind a slow or
+    /// frozen peer. A skipped peer does not count toward quorum: its in-flight
+    /// round may have sent its last RPC before the caller's round began.
     async fn replicate_one(self: &Arc<Self>, peer: Peer, wait: bool) -> RpcOutcome {
         let mutex = self.peer_lock(peer.id);
         let _guard = if wait {
