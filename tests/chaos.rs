@@ -786,22 +786,32 @@ fn check_logs(dir: &Path, ids: &[u64]) -> (usize, Vec<String>) {
         .map(|(_, state)| state["commit_index"].as_u64().unwrap_or(0) as usize)
         .min()
         .unwrap_or(0);
-    let empty = Vec::new();
-    let logs: Vec<(u64, &Vec<Value>)> = states
+    // The log is in ID.log.jsonl, one entry per line (a line torn by a kill
+    // ends it), or inside ID.json in older versions. Entry 0 is a sentinel.
+    let logs: Vec<(u64, Vec<Value>)> = states
         .iter()
-        .map(|(id, state)| (*id, state["log"].as_array().unwrap_or(&empty)))
+        .map(|(id, state)| {
+            let log = match state["log"].as_array() {
+                Some(log) => log.clone(),
+                None => std::fs::read_to_string(dir.join(format!("{id}.log.jsonl")))
+                    .unwrap_or_default()
+                    .lines()
+                    .map_while(|line| serde_json::from_str(line).ok())
+                    .collect(),
+            };
+            (*id, log)
+        })
         .collect();
     let mut violations = Vec::new();
-    let (first_id, first) = logs[0];
-    for &(id, log) in &logs[1..] {
-        if log.len() < commit || first.len() < commit {
+    let (first_id, first) = &logs[0];
+    for (id, log) in &logs[1..] {
+        if log.len() <= commit || first.len() <= commit {
             violations.push(format!("node {id} or {first_id} saved fewer than {commit} committed entries"));
             continue;
         }
-        if let Some(index) = (0..commit).find(|&i| log[i] != first[i]) {
+        if let Some(index) = (1..=commit).find(|&i| log[i] != first[i]) {
             violations.push(format!(
-                "committed entry {} differs: node {first_id} has {}, node {id} has {}",
-                index + 1,
+                "committed entry {index} differs: node {first_id} has {}, node {id} has {}",
                 first[index],
                 log[index]
             ));

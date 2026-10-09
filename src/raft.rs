@@ -17,7 +17,7 @@ use crate::net;
 use crate::telemetry::{Gauges, Telemetry};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -127,6 +127,12 @@ struct Inner {
     current_term: u64,
     voted_for: Option<u64>,
     log: Vec<Entry>,
+    /// Leading entries of `log` known to match the log file on disk; only
+    /// entries past this are appended on the next persist.
+    persisted: usize,
+    /// Entries (lines) in the log file. More than `persisted` means the file
+    /// holds a truncated suffix or a torn line and is rewritten in full.
+    on_disk: usize,
     commit_index: usize,
     last_applied: usize,
     next_index: HashMap<u64, usize>,
@@ -678,6 +684,7 @@ impl Node {
                             json!({ "index": index, "dropped": dropped, "leader": leader_id }),
                         );
                         inner.log.truncate(index);
+                        inner.persisted = inner.persisted.min(index);
                         inner.log.push(entry);
                         dirty = true;
                         membership_changed = true;
@@ -1312,6 +1319,8 @@ impl Inner {
                 term: 0,
                 command: Command::Noop,
             }],
+            persisted: 0,
+            on_disk: 0,
             commit_index: 0,
             last_applied: 0,
             next_index: HashMap::new(),
@@ -1716,7 +1725,7 @@ impl Inner {
         }
     }
 
-    fn persist(&self) {
+    fn persist(&mut self) {
         if self.data_dir.is_none() {
             return;
         }
@@ -1726,22 +1735,26 @@ impl Inner {
             .record_persist(started.elapsed(), result.is_ok(), result.err().as_deref());
     }
 
-    fn write_state(&self) -> Result<(), String> {
-        let Some(dir) = &self.data_dir else {
+    /// Save the log, then term, vote and commit index. The log file is
+    /// appended to, one JSON entry per line, so a persist costs the new
+    /// entries rather than the whole log; it is rewritten only after a
+    /// truncation. Entries go first so a saved commit index never points past
+    /// the saved log.
+    fn write_state(&mut self) -> Result<(), String> {
+        let Some(dir) = self.data_dir.clone() else {
             return Ok(());
         };
-        if let Err(err) = std::fs::create_dir_all(dir) {
+        if let Err(err) = std::fs::create_dir_all(&dir) {
             tracing::error!(node = self.id, path = %dir.display(), %err, "failed to create data dir");
             return Err(err.to_string());
         }
+        self.write_log(&dir)?;
         let path = dir.join(format!("{}.json", self.id));
         let tmp = dir.join(format!("{}.json.tmp", self.id));
-        let log: Vec<Value> = self.log.iter().map(entry_json).collect();
         let body = json!({
             "current_term": self.current_term,
             "voted_for": self.voted_for,
             "commit_index": self.commit_index,
-            "log": log,
         });
         let bytes = serde_json::to_vec(&body).unwrap_or_default();
         if let Err(err) = std::fs::write(&tmp, &bytes) {
@@ -1753,6 +1766,52 @@ impl Inner {
             return Err(err.to_string());
         }
         Ok(())
+    }
+
+    fn write_log(&mut self, dir: &Path) -> Result<(), String> {
+        use std::io::Write;
+        let path = dir.join(format!("{}.log.jsonl", self.id));
+        let rewrite = self.on_disk > self.persisted;
+        let from = if rewrite { 0 } else { self.persisted };
+        if from == self.log.len() && !rewrite {
+            return Ok(());
+        }
+        let mut lines = Vec::new();
+        for entry in &self.log[from..] {
+            serde_json::to_writer(&mut lines, &entry_json(entry)).map_err(|err| err.to_string())?;
+            lines.push(b'\n');
+        }
+        let result = if rewrite {
+            let tmp = dir.join(format!("{}.log.jsonl.tmp", self.id));
+            std::fs::write(&tmp, &lines).and_then(|()| std::fs::rename(&tmp, &path))
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut file| file.write_all(&lines))
+        };
+        if let Err(err) = result {
+            tracing::error!(node = self.id, path = %path.display(), %err, rewrite, "failed to write raft log");
+            // The file's tail is now unknown; rewrite it in full next time.
+            self.on_disk = usize::MAX;
+            return Err(err.to_string());
+        }
+        self.persisted = self.log.len();
+        self.on_disk = self.log.len();
+        Ok(())
+    }
+
+    /// Entries from the log file, stopping at the first line that does not
+    /// parse (a write torn by a crash), and how many lines the file holds.
+    fn read_log(&self, dir: &Path) -> Option<(Vec<Entry>, usize)> {
+        let text = std::fs::read_to_string(dir.join(format!("{}.log.jsonl", self.id))).ok()?;
+        let lines = text.lines().count();
+        let entries = text
+            .lines()
+            .map_while(|line| serde_json::from_str::<Value>(line).ok().as_ref().and_then(parse_entry))
+            .collect();
+        Some((entries, lines))
     }
 
     fn load(&mut self) {
@@ -1768,18 +1827,23 @@ impl Inner {
             tracing::warn!(node = self.id, path = %path.display(), "ignoring unreadable raft state");
             return;
         };
-        let Some(entries) = value.get("log").and_then(|v| v.as_array()) else {
-            return;
+        // Older versions kept the log inside this file; it is moved to the
+        // log file by the first persist.
+        let (log, on_disk) = match value.get("log").and_then(|v| v.as_array()) {
+            Some(entries) => (entries.iter().filter_map(parse_entry).collect(), usize::MAX),
+            // A torn last line leaves more lines than entries, which makes the
+            // next persist rewrite the file.
+            None => match self.read_log(dir) {
+                Some(found) => found,
+                None => return,
+            },
         };
-        let mut log = Vec::new();
-        for raw in entries {
-            if let Some(entry) = parse_entry(raw) {
-                log.push(entry);
-            }
-        }
+        let log: Vec<Entry> = log;
         if log.is_empty() {
             return;
         }
+        self.persisted = log.len();
+        self.on_disk = on_disk;
         self.current_term = u64_field(&value, "current_term").unwrap_or(0);
         self.voted_for = value.get("voted_for").and_then(|v| v.as_u64());
         self.log = log;

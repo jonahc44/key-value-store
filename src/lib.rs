@@ -422,6 +422,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn torn_log_line_is_dropped_on_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "kv-torn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nodes = cluster(1, Some(dir.clone())).await;
+        let addr = nodes[0].addr.clone();
+        assert_eq!(put(&addr, "a", json!({"v": 1})).await.0, 201);
+        assert_eq!(put(&addr, "b", json!({"v": 2})).await.0, 201);
+        nodes.into_iter().next().unwrap().stop().await;
+
+        // A crash mid-append leaves half a line at the end of the log.
+        let log = dir.join("1.log.jsonl");
+        let mut torn = std::fs::read(&log).unwrap();
+        torn.extend_from_slice(br#"{"term":1,"op":"put","ke"#);
+        std::fs::write(&log, torn).unwrap();
+
+        let nodes = cluster(1, Some(dir.clone())).await;
+        let addr = nodes[0].addr.clone();
+        assert_eq!(get(&addr, "b").await.1, json!({"v": 2}));
+        assert_eq!(put(&addr, "c", json!({"v": 3})).await.0, 201);
+        nodes.into_iter().next().unwrap().stop().await;
+
+        let nodes = cluster(1, Some(dir.clone())).await;
+        let addr = nodes[0].addr.clone();
+        for (key, v) in [("a", 1), ("b", 2), ("c", 3)] {
+            assert_eq!(get(&addr, key).await.1, json!({"v": v}), "{key}");
+        }
+        nodes.into_iter().next().unwrap().stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn node_added_at_runtime_becomes_voter() {
         let mut nodes = cluster(3, None).await;
         let leader = wait_leader(&nodes).await;
