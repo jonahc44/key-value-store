@@ -63,7 +63,13 @@ async fn serve_on(listener: tokio::net::TcpListener, config: Config) -> std::io:
         config.peers.len()
     };
     let node_id = config.id;
-    tracing::info!(node = node_id, %addr, members, "listening");
+    tracing::info!(
+        node = node_id,
+        %addr,
+        members,
+        "node id {node_id} listening on {addr}; see it in GET /cluster/members, \
+         remove it with DELETE /cluster/members/{node_id}"
+    );
     let join = config
         .join
         .clone()

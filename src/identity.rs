@@ -32,11 +32,11 @@ pub(crate) async fn resolve(
 ) -> std::io::Result<Identity> {
     let path = data_dir.map(|dir| identity_path(dir, listen));
     if let Some(identity) = path.as_deref().and_then(load) {
-        tracing::info!(node = identity.id, "loaded saved node id");
+        tracing::info!(node = identity.id, "using saved node id {}", identity.id);
         return Ok(identity);
     }
     let id = random_id();
-    tracing::info!(node = id, "assigned random node id");
+    tracing::info!(node = id, "assigned random node id {id}");
     let peers = if peers.is_empty() {
         Vec::new()
     } else {
