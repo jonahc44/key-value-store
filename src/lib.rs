@@ -943,9 +943,19 @@ mod tests {
             assert_eq!(put(&addr, &key, json!({"v": i})).await.0, 201);
         }
         assert_eq!(delete(&addr, "k3").await, 204);
-        assert!(metric(&addr, "raft_snapshot_index").await >= 50);
-        // At most 10 entries since the snapshot, plus a tail of 10 / 4.
-        assert!(metric(&addr, "raft_log_entries").await <= 12);
+        // Snapshots are saved in the background, so the last may still be
+        // in flight.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = metric(&addr, "raft_snapshot_index").await;
+            let held = metric(&addr, "raft_log_entries").await;
+            // At most 10 entries since the snapshot, plus a tail of 10 / 4.
+            if snapshot >= 50 && held <= 12 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "snapshot at {snapshot}, {held} entries held");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let lines = std::fs::read_to_string(dir.join("1.log.jsonl"))
             .unwrap()
             .lines()
@@ -999,5 +1009,67 @@ mod tests {
         for node in nodes {
             node.stop().await;
         }
+    }
+
+    /// How long writes stall while a large key space is snapshotted. Grows a
+    /// single member to KV_BENCH_KEYS distinct keys (default 300000) with a
+    /// snapshot every third of that, and reports write latency.
+    ///
+    ///     cargo test --release --lib snapshot_stall -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "writes hundreds of thousands of entries; use --ignored"]
+    async fn snapshot_stall() {
+        use crate::raft::Command;
+        let keys: usize = std::env::var("KV_BENCH_KEYS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(300_000);
+        // KV_BENCH_SNAPSHOT_EVERY=0 gives a baseline without compaction.
+        let snapshot_every: usize = std::env::var("KV_BENCH_SNAPSHOT_EVERY")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(keys / 3);
+        let writers = 32;
+        let dir = std::env::temp_dir().join(format!("kv-stall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nodes = cluster_with(1, Some(dir.clone()), snapshot_every).await;
+        let node = Arc::clone(&nodes[0].node);
+        let started = Instant::now();
+        let mut tasks = Vec::new();
+        for writer in 0..writers {
+            let node = Arc::clone(&node);
+            tasks.push(tokio::spawn(async move {
+                let mut latencies = Vec::new();
+                for n in (writer..keys).step_by(writers) {
+                    let command = Command::Put {
+                        key: format!("key-{n:08}"),
+                        value: json!({ "n": n, "pad": "x".repeat(64) }),
+                    };
+                    let at = Instant::now();
+                    assert!(node.propose(command).await.is_ok(), "write {n} failed");
+                    latencies.push(at.elapsed());
+                }
+                latencies
+            }));
+        }
+        let mut latencies = Vec::new();
+        for task in tasks {
+            latencies.extend(task.await.unwrap());
+        }
+        let elapsed = started.elapsed();
+        latencies.sort_unstable();
+        let at = |q: f64| latencies[((latencies.len() - 1) as f64 * q) as usize].as_secs_f64() * 1e3;
+        let snapshot = std::fs::metadata(dir.join("1.snapshot.json")).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "snapshot_stall: {keys} writes in {:.1}s; latency ms p50 {:.2} p99 {:.2} p99.9 {:.2} max {:.1}; snapshot {:.1} MB",
+            elapsed.as_secs_f64(),
+            at(0.5),
+            at(0.99),
+            at(0.999),
+            at(1.0),
+            snapshot as f64 / 1e6
+        );
+        nodes.into_iter().next().unwrap().stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

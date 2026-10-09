@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 const HEARTBEAT: Duration = Duration::from_millis(40);
@@ -111,12 +111,93 @@ struct Entry {
 }
 
 /// The state machine as of log entry `index`, which replaces the log up to it.
+/// The key space is a persistent map, so a copy taken under the node lock is
+/// O(1) and stays frozen while later writes go on (Raft thesis §5.1.1);
+/// serializing and saving it happens outside the lock.
 struct Snapshot {
     index: usize,
     term: u64,
     config_index: usize,
     membership: Membership,
-    data: HashMap<String, Value>,
+    data: KeySpace,
+}
+
+type KeySpace = imbl::HashMap<String, Value>;
+
+impl Snapshot {
+    /// The snapshot file's format, which is also the body of InstallSnapshot.
+    fn to_text(&self) -> String {
+        let mut text = json!({
+            "index": self.index,
+            "term": self.term,
+            "config_index": self.config_index,
+            "voters": peers_json(&self.membership.voters),
+            "learners": peers_json(&self.membership.learners),
+        })
+        .to_string();
+        // Splice the key space in rather than copying it into a `Value`.
+        text.pop();
+        text.push_str(r#","data":{"#);
+        for (n, (key, value)) in self.data.iter().enumerate() {
+            if n > 0 {
+                text.push(',');
+            }
+            text.push_str(&Value::from(key.as_str()).to_string());
+            text.push(':');
+            text.push_str(&value.to_string());
+        }
+        text.push_str("}}");
+        text
+    }
+}
+
+/// A snapshot saved by the background writer, waiting to be put in place.
+struct Saved {
+    index: usize,
+    text: Arc<String>,
+    /// The temporary file holding it, or why it could not be written; `None`
+    /// without a data dir.
+    file: Option<Result<PathBuf, String>>,
+    /// Base of the compacted log, and a temporary log file holding it up to
+    /// the snapshot (or why that could not be written), to be completed and
+    /// put in place with the snapshot.
+    base: usize,
+    log_file: Option<Result<PathBuf, String>>,
+}
+
+/// Work for the background snapshot writer, captured under the node lock.
+struct SnapshotJob {
+    snapshot: Snapshot,
+    dir: Option<PathBuf>,
+    /// Where the log will start once compacted, and its entries from there
+    /// up to the snapshot; these are committed, so they cannot change.
+    base: usize,
+    kept: Vec<Arc<Entry>>,
+}
+
+impl SnapshotJob {
+    /// Serialize the snapshot and, with a data dir, save it and the start of
+    /// the compacted log to temporary files. Runs off the node lock.
+    fn run(self, id: u64) -> Saved {
+        let text = Arc::new(self.snapshot.to_text());
+        let file = self.dir.as_ref().map(|dir| save_snapshot_file(dir, id, &text));
+        let log_file = self.dir.as_ref().map(|dir| {
+            let mut lines = Vec::new();
+            for (slot, entry) in self.kept.iter().enumerate() {
+                encode_log_line(&mut lines, slot, self.base, entry)?;
+            }
+            let tmp = dir.join(format!("{id}.log.jsonl.compacted"));
+            std::fs::write(&tmp, &lines).map_err(|err| err.to_string())?;
+            Ok(tmp)
+        });
+        Saved {
+            index: self.snapshot.index,
+            text,
+            file,
+            base: self.base,
+            log_file,
+        }
+    }
 }
 
 pub(crate) enum RaftError {
@@ -151,7 +232,7 @@ struct Inner {
     /// Entries from index `log_base` on; `log[0]` is entry `log_base`. Below
     /// that the log is compacted into the snapshot, and `log[0]` only gives
     /// the term (at index 0, a sentinel). Use `entry` and `term_at` to index.
-    log: Vec<Entry>,
+    log: Vec<Arc<Entry>>,
     log_base: usize,
     /// The configuration in effect at `log_base`, and its index, used when the
     /// remaining log holds none.
@@ -159,8 +240,14 @@ struct Inner {
     /// Index of the latest snapshot; at or above `log_base`.
     snapshot_index: usize,
     snapshot_every: usize,
-    /// The leader's latest snapshot, serialized, for followers that need it.
-    /// Usable while its index is at or above `log_base`.
+    /// Applied index at which the next snapshot is taken.
+    next_snapshot_at: usize,
+    /// A snapshot is being serialized and saved by the background writer.
+    snapshotting: bool,
+    /// Hands captured snapshots to the background writer.
+    snapshot_jobs: Option<mpsc::UnboundedSender<SnapshotJob>>,
+    /// This member's latest snapshot, serialized, for followers that need it
+    /// when leading. Usable while its index is at or above `log_base`.
     snapshot_cache: Option<(usize, Arc<String>)>,
     /// Leading entries of `log` known to match the log file on disk; only
     /// entries past this are appended on the next persist.
@@ -174,7 +261,7 @@ struct Inner {
     next_index: HashMap<u64, usize>,
     match_index: HashMap<u64, usize>,
     leader_id: Option<u64>,
-    data: HashMap<String, Value>,
+    data: KeySpace,
     waiters: HashMap<usize, oneshot::Sender<bool>>,
     election_timeout: Duration,
     election_deadline: Instant,
@@ -233,6 +320,8 @@ impl Node {
             config.snapshot_every,
             Arc::clone(&telemetry),
         );
+        let (jobs, pending_snapshots) = mpsc::unbounded_channel();
+        inner.snapshot_jobs = Some(jobs);
         inner.load();
         telemetry.event(
             "node_started",
@@ -271,6 +360,7 @@ impl Node {
         let ticker = Arc::clone(&node);
         tokio::spawn(async move { ticker.tick_loop().await });
         tokio::spawn(Self::stats_loop(Arc::downgrade(&node)));
+        tokio::spawn(Self::snapshot_loop(Arc::downgrade(&node), pending_snapshots));
         node
     }
 
@@ -294,6 +384,35 @@ impl Node {
     pub(crate) async fn metrics_text(&self) -> String {
         let gauges = self.inner.lock().await.gauges();
         self.telemetry.render(&gauges)
+    }
+
+    /// Serialize and save the snapshots `maybe_compact` captures, off the
+    /// node lock; the lock is taken only to put each file in place and cut
+    /// the log.
+    async fn snapshot_loop(
+        node: std::sync::Weak<Self>,
+        mut jobs: mpsc::UnboundedReceiver<SnapshotJob>,
+    ) {
+        while let Some(job) = jobs.recv().await {
+            let Some(this) = node.upgrade() else {
+                break;
+            };
+            let id = this.id;
+            let saved = tokio::task::spawn_blocking(move || job.run(id)).await;
+            let dropped = {
+                let mut inner = this.inner.lock().await;
+                match saved {
+                    Ok(saved) => inner.finish_snapshot(saved),
+                    Err(err) => {
+                        tracing::error!(node = id, %err, "snapshot writer failed");
+                        inner.snapshotting = false;
+                        Vec::new()
+                    }
+                }
+            };
+            // Freeing tens of thousands of entries takes a while.
+            tokio::task::spawn_blocking(move || drop(dropped));
+        }
     }
 
     async fn stats_loop(node: std::sync::Weak<Self>) {
@@ -739,13 +858,13 @@ impl Node {
                     let keep = index - inner.log_base;
                     inner.log.truncate(keep);
                     inner.persisted = inner.persisted.min(keep);
-                    inner.log.push(entry);
+                    inner.log.push(entry.into());
                     dirty = true;
                     membership_changed = true;
                 }
             } else if index == inner.last_index() + 1 {
                 membership_changed |= matches!(entry.command, Command::Config(_));
-                inner.log.push(entry);
+                inner.log.push(entry.into());
                 dirty = true;
             } else {
                 return json!({
@@ -777,37 +896,70 @@ impl Node {
 
     /// Replace the state machine with the leader's snapshot (Raft §7). The
     /// log after the snapshot is kept if it agrees with it, as a delayed
-    /// snapshot must not undo entries received since.
+    /// snapshot must not undo entries received since. Parsing and saving the
+    /// key space happen outside the node lock.
     pub(crate) async fn handle_install_snapshot(&self, req: &Value) -> Value {
-        let mut inner = self.inner.lock().await;
         let term = u64_field(req, "term").unwrap_or(0);
         let leader_id = u64_field(req, "leader_id").unwrap_or(0);
-        if term < inner.current_term {
-            return json!({ "term": inner.current_term, "success": false });
-        }
-        inner.follow(term, leader_id);
         let Some(snapshot) = req.get("snapshot").and_then(parse_snapshot) else {
-            tracing::warn!(node = inner.id, leader = leader_id, "unreadable snapshot");
-            return json!({ "term": inner.current_term, "success": false });
+            tracing::warn!(node = self.id, leader = leader_id, "unreadable snapshot");
+            return json!({ "term": term, "success": false });
         };
-        // Committed entries match the leader's, so a snapshot within them
-        // adds nothing.
-        if snapshot.index <= inner.commit_index {
-            return json!({ "term": inner.current_term, "success": true });
+        let index = snapshot.index;
+        let dir = {
+            let mut inner = self.inner.lock().await;
+            if term < inner.current_term {
+                return json!({ "term": inner.current_term, "success": false });
+            }
+            inner.follow(term, leader_id);
+            // Committed entries match the leader's, so a snapshot within them
+            // adds nothing.
+            if index <= inner.commit_index {
+                return json!({ "term": inner.current_term, "success": true });
+            }
+            inner.data_dir.clone()
+        };
+
+        let text = Arc::new(req["snapshot"].to_string());
+        let file = match dir {
+            Some(dir) => {
+                let (id, text) = (self.id, Arc::clone(&text));
+                let saved =
+                    tokio::task::spawn_blocking(move || save_snapshot_file(&dir, id, &text)).await;
+                Some(saved.map_err(|err| err.to_string()).and_then(|saved| saved))
+            }
+            None => None,
+        };
+
+        let mut inner = self.inner.lock().await;
+        let tmp = match file {
+            Some(Ok(tmp)) => Some(tmp),
+            Some(Err(err)) => {
+                inner.telemetry.persist_failures.inc();
+                tracing::error!(node = inner.id, %err, "failed to save installed snapshot");
+                return json!({ "term": inner.current_term, "success": false });
+            }
+            None => None,
+        };
+        // Another leader, or this one's log, may have moved on meanwhile.
+        if inner.current_term != term || index <= inner.commit_index {
+            if let Some(tmp) = &tmp {
+                let _ = std::fs::remove_file(tmp);
+            }
+            let success = inner.current_term == term;
+            return json!({ "term": inner.current_term, "success": success });
         }
-        // Saved before the log is rewritten to start at it, so the log file
-        // never starts past the saved snapshot.
-        if let Some(dir) = inner.data_dir.clone() {
-            let text = req["snapshot"].to_string();
-            if let Err(err) = inner.write_snapshot(&dir, &text) {
+        // Put in place before the log is rewritten to start at it, so the log
+        // file never starts past the saved snapshot.
+        if let Some(tmp) = &tmp {
+            if let Err(err) = inner.place_snapshot_file(tmp) {
                 inner.telemetry.persist_failures.inc();
                 tracing::error!(node = inner.id, %err, "failed to save installed snapshot");
                 return json!({ "term": inner.current_term, "success": false });
             }
         }
-        let index = snapshot.index;
         let keys = snapshot.data.len();
-        inner.restore(snapshot);
+        inner.restore(snapshot, text);
         inner.persist();
         tracing::info!(node = inner.id, leader = leader_id, index, keys, "installed snapshot");
         inner.telemetry.snapshots_installed.inc();
@@ -1282,7 +1434,7 @@ impl Node {
         for _ in 0..128 {
             // `matched` is how far the peer's log matches if it accepts.
             let (term, request, matched, last) = {
-                let mut inner = self.inner.lock().await;
+                let inner = self.inner.lock().await;
                 if inner.role != Role::Leader {
                     return RpcOutcome::Unreachable;
                 }
@@ -1292,12 +1444,19 @@ impl Node {
                 let last = inner.last_index();
                 let request = if prev < inner.log_base {
                     // The entries the peer needs are compacted away.
-                    let (index, snapshot) = inner.snapshot_text();
-                    let body = format!(
-                        r#"{{"term":{term},"leader_id":{},"snapshot":{snapshot}}}"#,
-                        inner.id
-                    );
-                    Outbound::Snapshot { index, body }
+                    let Some((index, text)) = inner.cached_snapshot() else {
+                        // Serialize a fresh capture off the lock, then retry.
+                        let capture = inner.capture();
+                        drop(inner);
+                        let index = capture.index;
+                        let Ok(text) = tokio::task::spawn_blocking(move || capture.to_text()).await
+                        else {
+                            return RpcOutcome::Unreachable;
+                        };
+                        self.inner.lock().await.offer_snapshot_text(index, Arc::new(text));
+                        continue;
+                    };
+                    Outbound::Snapshot { index, text }
                 } else {
                     let end = (next + 32).min(last + 1);
                     let entries = (next..end)
@@ -1326,7 +1485,11 @@ impl Node {
                 Outbound::Append { request, .. } => {
                     self.peer_rpc(&peer, "/raft/append-entries", request).await
                 }
-                Outbound::Snapshot { index, body } => {
+                Outbound::Snapshot { index, text } => {
+                    let body = format!(
+                        r#"{{"term":{term},"leader_id":{},"snapshot":{text}}}"#,
+                        self.id
+                    );
                     // Retried every round while the peer is down, so quiet.
                     tracing::debug!(node = self.id, peer = peer.id, index, bytes = body.len(), "sending snapshot");
                     self.peer_post(&peer, "/raft/install-snapshot", body.as_bytes(), SNAPSHOT_RPC_TIMEOUT)
@@ -1417,8 +1580,8 @@ impl Node {
 /// One replication RPC to a peer.
 enum Outbound {
     Append { matched: usize, request: Value },
-    /// The serialized `InstallSnapshot` request for a snapshot at `index`.
-    Snapshot { index: usize, body: String },
+    /// A serialized snapshot at `index`, sent as `InstallSnapshot`.
+    Snapshot { index: usize, text: Arc<String> },
 }
 
 struct Departing {
@@ -1458,10 +1621,13 @@ impl Inner {
             log: vec![Entry {
                 term: 0,
                 command: Command::Noop,
-            }],
+            }.into()],
             log_base: 0,
             snapshot_index: 0,
             snapshot_every,
+            next_snapshot_at: snapshot_every,
+            snapshotting: false,
+            snapshot_jobs: None,
             snapshot_cache: None,
             persisted: 0,
             on_disk: 0,
@@ -1470,7 +1636,7 @@ impl Inner {
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             leader_id: None,
-            data: HashMap::new(),
+            data: KeySpace::new(),
             waiters: HashMap::new(),
             election_timeout,
             election_deadline: now + election_timeout,
@@ -1560,7 +1726,7 @@ impl Inner {
         let (op, key) = command_fields(&command);
         let key = key.to_string();
         let is_config = matches!(command, Command::Config(_));
-        self.log.push(Entry { term, command });
+        self.log.push(Entry { term, command }.into());
         let index = self.last_index();
         tracing::debug!(node = self.id, term, index, op, key, "proposed");
         if is_config {
@@ -1747,7 +1913,7 @@ impl Inner {
         self.log.push(Entry {
             term: self.current_term,
             command: Command::Noop,
-        });
+        }.into());
         let now = Instant::now();
         self.last_heartbeat_sent = now;
         self.last_quorum_ok = now;
@@ -1902,110 +2068,203 @@ impl Inner {
     }
 
     /// Once `snapshot_every` entries were applied since the last snapshot,
-    /// snapshot the applied state and drop the log before it, keeping a
-    /// quarter of `snapshot_every` entries for followers that are a little
-    /// behind. The log file is rewritten from the new base on the next
-    /// persist.
+    /// capture the applied state, and the committed entries the compacted log
+    /// will start with, for the background writer. It serializes and saves
+    /// them off the lock, then calls `finish_snapshot`.
     fn maybe_compact(&mut self) {
         if self.snapshot_every == 0
-            || self.last_applied < self.snapshot_index + self.snapshot_every
+            || self.snapshotting
+            || self.last_applied < self.next_snapshot_at
         {
             return;
         }
-        let index = self.last_applied;
-        let text = Arc::new(self.snapshot_json().to_string());
-        // Saved before the log shrinks, so the log file never starts past
-        // the saved snapshot.
-        if let Some(dir) = self.data_dir.clone() {
-            if let Err(err) = self.write_snapshot(&dir, &text) {
-                self.telemetry.persist_failures.inc();
-                tracing::error!(node = self.id, index, %err, "failed to save snapshot; log not compacted");
-                return;
-            }
-        }
-        let base = index
+        let Some(jobs) = &self.snapshot_jobs else {
+            return;
+        };
+        let snapshot = self.capture();
+        // Keep a quarter of `snapshot_every` entries for followers that are
+        // a little behind.
+        let base = snapshot
+            .index
             .saturating_sub(self.snapshot_every / 4)
             .max(self.log_base);
+        let kept = match self.data_dir {
+            Some(_) => self.log[base - self.log_base..=snapshot.index - self.log_base].to_vec(),
+            None => Vec::new(),
+        };
+        let job = SnapshotJob {
+            snapshot,
+            dir: self.data_dir.clone(),
+            base,
+            kept,
+        };
+        if jobs.send(job).is_ok() {
+            self.snapshotting = true;
+        }
+    }
+
+    /// The applied state as a snapshot. O(1): the key space is shared with
+    /// later writes rather than copied.
+    fn capture(&self) -> Snapshot {
+        let index = self.last_applied;
+        let (config_index, membership) = self.membership_at(index);
+        Snapshot {
+            index,
+            term: self.entry(index).term,
+            config_index,
+            membership,
+            data: self.data.clone(),
+        }
+    }
+
+    /// Put a snapshot the background writer saved in place, then cut the log
+    /// to the base it was captured with. The compacted log file was mostly
+    /// written with the snapshot; only entries appended since are added here.
+    /// Returns the cut entries, for the caller to free outside the lock.
+    fn finish_snapshot(&mut self, saved: Saved) -> Vec<Arc<Entry>> {
+        self.snapshotting = false;
+        let (index, base) = (saved.index, saved.base);
+        let discard = |saved: &Saved| {
+            for tmp in [&saved.file, &saved.log_file].into_iter().flatten().flatten() {
+                let _ = std::fs::remove_file(tmp);
+            }
+        };
+        // A snapshot installed from the leader meanwhile supersedes this one.
+        // Otherwise the log still starts where it did at the capture.
+        if index <= self.snapshot_index || base < self.log_base {
+            discard(&saved);
+            return Vec::new();
+        }
+        // Put in place before the log shrinks, so the log file never starts
+        // past the saved snapshot.
+        let placed = match &saved.file {
+            Some(Ok(tmp)) => self.place_snapshot_file(tmp),
+            Some(Err(err)) => Err(err.clone()),
+            None => Ok(()),
+        };
+        if let Err(err) = placed {
+            discard(&saved);
+            self.telemetry.persist_failures.inc();
+            // Retry after another round of entries, not on every one.
+            self.next_snapshot_at = self.last_applied + self.snapshot_every;
+            tracing::error!(node = self.id, index, %err, "failed to save snapshot; log not compacted");
+            return Vec::new();
+        }
+        let log_placed = match &saved.log_file {
+            Some(Ok(tmp)) => self.complete_log_file(tmp, base, index),
+            Some(Err(err)) => Err(err.clone()),
+            None => Ok(()),
+        };
+
         self.base_membership = self.membership_at(base);
-        self.log.drain(..base - self.log_base);
+        let kept = self.log.split_off(base - self.log_base);
+        let dropped = std::mem::replace(&mut self.log, kept);
         self.log_base = base;
         self.snapshot_index = index;
-        self.snapshot_cache = Some((index, text));
-        self.persisted = 0;
-        self.on_disk = usize::MAX;
+        self.next_snapshot_at = index + self.snapshot_every;
+        self.offer_snapshot_text(index, saved.text);
+        match log_placed {
+            Ok(()) => {
+                self.persisted = self.log.len();
+                self.on_disk = self.log.len();
+            }
+            Err(err) => {
+                // Rewrite it here instead, under the lock.
+                tracing::warn!(node = self.id, index, %err, "failed to prepare compacted log; rewriting it");
+                if let Some(Ok(tmp)) = &saved.log_file {
+                    let _ = std::fs::remove_file(tmp);
+                }
+                self.persisted = 0;
+                self.on_disk = usize::MAX;
+                self.persist();
+            }
+        }
         tracing::info!(node = self.id, index, log_base = base, keys = self.data.len(), "took snapshot");
         self.telemetry.snapshots_taken.inc();
         self.telemetry.event(
             "snapshot_taken",
             json!({ "index": index, "log_base": base, "keys": self.data.len() }),
         );
+        dropped
     }
 
-    /// The applied state as a snapshot, in the snapshot file's format.
-    fn snapshot_json(&self) -> Value {
-        let index = self.last_applied;
-        let (config_index, membership) = self.membership_at(index);
-        json!({
-            "index": index,
-            "term": self.entry(index).term,
-            "config_index": config_index,
-            "voters": peers_json(&membership.voters),
-            "learners": peers_json(&membership.learners),
-            "data": self.data,
-        })
+    /// Append the entries after `index` to `tmp`, the compacted log the
+    /// background writer started from `base` up to `index`, and put it in
+    /// place of the log file.
+    fn complete_log_file(&self, tmp: &Path, base: usize, index: usize) -> Result<(), String> {
+        use std::io::Write;
+        let mut lines = Vec::new();
+        for at in (index + 1)..=self.last_index() {
+            encode_log_line(&mut lines, at - base, base, self.entry(at))?;
+        }
+        let path = tmp.with_file_name(format!("{}.log.jsonl", self.id));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(tmp)
+            .and_then(|mut file| file.write_all(&lines))
+            .and_then(|()| std::fs::rename(tmp, &path))
+            .map_err(|err| err.to_string())
     }
 
     /// A serialized snapshot to send a follower that needs compacted entries,
     /// and its index. Any snapshot from `log_base` on will do, as the log
     /// continues from there, so one is reused until compaction passes it.
-    fn snapshot_text(&mut self) -> (usize, Arc<String>) {
-        if let Some((index, text)) = &self.snapshot_cache {
-            if *index >= self.log_base {
-                return (*index, Arc::clone(text));
-            }
+    fn cached_snapshot(&self) -> Option<(usize, Arc<String>)> {
+        self.snapshot_cache
+            .as_ref()
+            .filter(|(index, _)| *index >= self.log_base)
+            .map(|(index, text)| (*index, Arc::clone(text)))
+    }
+
+    /// Keep `text`, a snapshot at `index`, for followers, unless a newer one
+    /// is cached.
+    fn offer_snapshot_text(&mut self, index: usize, text: Arc<String>) {
+        if self
+            .snapshot_cache
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached < index)
+        {
+            self.snapshot_cache = Some((index, text));
         }
-        let text = Arc::new(self.snapshot_json().to_string());
-        self.snapshot_cache = Some((self.last_applied, Arc::clone(&text)));
-        (self.last_applied, text)
     }
 
-    fn write_snapshot(&self, dir: &Path, text: &str) -> Result<(), String> {
-        std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+    /// Replace the snapshot file with `tmp`, written by `save_snapshot_file`.
+    /// Done under the node lock, so the file and the log base change in step.
+    fn place_snapshot_file(&self, tmp: &Path) -> Result<(), String> {
+        let dir = tmp.parent().unwrap_or(Path::new("."));
         let path = dir.join(format!("{}.snapshot.json", self.id));
-        let tmp = dir.join(format!("{}.snapshot.json.tmp", self.id));
-        std::fs::write(&tmp, text)
-            .and_then(|()| std::fs::rename(&tmp, &path))
-            .map_err(|err| err.to_string())
+        std::fs::rename(tmp, &path).map_err(|err| err.to_string())
     }
 
-    fn read_snapshot(&self, dir: &Path) -> Option<Snapshot> {
+    fn read_snapshot(&self, dir: &Path) -> Option<(Snapshot, Arc<String>)> {
         let path = dir.join(format!("{}.snapshot.json", self.id));
-        let bytes = std::fs::read(&path).ok()?;
-        let snapshot = serde_json::from_slice::<Value>(&bytes)
+        let text = std::fs::read_to_string(&path).ok()?;
+        let snapshot = serde_json::from_str::<Value>(&text)
             .ok()
             .as_ref()
             .and_then(parse_snapshot);
         if snapshot.is_none() {
             tracing::error!(node = self.id, path = %path.display(), "ignoring unreadable snapshot");
         }
-        snapshot
+        Some((snapshot?, Arc::new(text)))
     }
 
-    /// Replace the state machine with `snapshot`. Log entries after it are
-    /// kept if the log holds its last entry; otherwise the log restarts at
-    /// it. The log file is rewritten on the next persist.
-    fn restore(&mut self, snapshot: Snapshot) {
+    /// Replace the state machine with `snapshot`, serialized as `text`. Log
+    /// entries after it are kept if the log holds its last entry; otherwise
+    /// the log restarts at it. The log file is rewritten on the next persist.
+    fn restore(&mut self, snapshot: Snapshot, text: Arc<String>) {
         if self.term_at(snapshot.index) == Some(snapshot.term) {
             self.log.drain(..snapshot.index - self.log_base);
         } else {
             self.log = vec![Entry {
                 term: snapshot.term,
                 command: Command::Noop,
-            }];
+            }.into()];
         }
         self.log_base = snapshot.index;
         self.snapshot_index = snapshot.index;
-        self.snapshot_cache = None;
+        self.next_snapshot_at = snapshot.index + self.snapshot_every;
+        self.snapshot_cache = Some((snapshot.index, text));
         self.base_membership = (snapshot.config_index, snapshot.membership);
         self.data = snapshot.data;
         self.last_applied = snapshot.index;
@@ -2070,13 +2329,7 @@ impl Inner {
         }
         let mut lines = Vec::new();
         for (slot, entry) in self.log.iter().enumerate().skip(from) {
-            let line = if slot == 0 {
-                json!({ "term": entry.term, "op": "noop", "base": self.log_base })
-            } else {
-                entry_json(entry)
-            };
-            serde_json::to_writer(&mut lines, &line).map_err(|err| err.to_string())?;
-            lines.push(b'\n');
+            encode_log_line(&mut lines, slot, self.log_base, entry)?;
         }
         let result = if rewrite {
             let tmp = dir.join(format!("{}.log.jsonl.tmp", self.id));
@@ -2102,7 +2355,7 @@ impl Inner {
     /// Entries from the log file, stopping at the first line that does not
     /// parse (a write torn by a crash), the index of the first, and how many
     /// lines the file holds.
-    fn read_log(&self, dir: &Path) -> Option<(Vec<Entry>, usize, usize)> {
+    fn read_log(&self, dir: &Path) -> Option<(Vec<Arc<Entry>>, usize, usize)> {
         let text = std::fs::read_to_string(dir.join(format!("{}.log.jsonl", self.id))).ok()?;
         let lines = text.lines().count();
         let base = text
@@ -2113,7 +2366,7 @@ impl Inner {
             .unwrap_or(0) as usize;
         let entries = text
             .lines()
-            .map_while(|line| serde_json::from_str::<Value>(line).ok().as_ref().and_then(parse_entry))
+            .map_while(|line| serde_json::from_str::<Value>(line).ok().as_ref().and_then(parse_entry).map(Arc::new))
             .collect();
         Some((entries, base, lines))
     }
@@ -2123,6 +2376,18 @@ impl Inner {
             return;
         };
         let dir = &dir;
+        // Snapshots and compacted logs a crash left unplaced; the files in
+        // place are intact.
+        let stale = [
+            format!("{}.snapshot.json.tmp", self.id),
+            format!("{}.log.jsonl.compacted", self.id),
+        ];
+        for file in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            if stale.iter().any(|prefix| name.starts_with(prefix)) {
+                let _ = std::fs::remove_file(file.path());
+            }
+        }
         let path = dir.join(format!("{}.json", self.id));
         let Ok(bytes) = std::fs::read(&path) else {
             tracing::debug!(node = self.id, path = %path.display(), "no raft state to load");
@@ -2135,7 +2400,7 @@ impl Inner {
         // Older versions kept the log inside this file; it is moved to the
         // log file by the first persist.
         let (log, base, on_disk) = match value.get("log").and_then(|v| v.as_array()) {
-            Some(entries) => (entries.iter().filter_map(parse_entry).collect(), 0, usize::MAX),
+            Some(entries) => (entries.iter().filter_map(parse_entry).map(Arc::new).collect(), 0, usize::MAX),
             // A torn last line leaves more lines than entries, which makes the
             // next persist rewrite the file.
             None => match self.read_log(dir) {
@@ -2143,7 +2408,7 @@ impl Inner {
                 None => return,
             },
         };
-        let log: Vec<Entry> = log;
+        let log: Vec<Arc<Entry>> = log;
         if log.is_empty() {
             return;
         }
@@ -2158,7 +2423,7 @@ impl Inner {
         self.data.clear();
         self.last_applied = 0;
         match self.read_snapshot(dir) {
-            Some(snapshot) => self.restore(snapshot),
+            Some((snapshot, text)) => self.restore(snapshot, text),
             None if base > 0 => {
                 // The snapshot is saved before the log is cut, so this
                 // takes a damaged data dir; the state is gone.
@@ -2170,7 +2435,7 @@ impl Inner {
                 self.log = vec![Entry {
                     term: 0,
                     command: Command::Noop,
-                }];
+                }.into()];
                 self.log_base = 0;
                 self.commit_index = 0;
                 self.persisted = 0;
@@ -2281,6 +2546,30 @@ fn parse_peers(value: &Value) -> Option<Vec<Peer>> {
         .collect()
 }
 
+/// Append line `slot` of a log file whose first entry is `base`: the entry,
+/// or for slot 0 a noop that carries the base.
+fn encode_log_line(lines: &mut Vec<u8>, slot: usize, base: usize, entry: &Entry) -> Result<(), String> {
+    let line = if slot == 0 {
+        json!({ "term": entry.term, "op": "noop", "base": base })
+    } else {
+        entry_json(entry)
+    };
+    serde_json::to_writer(&mut *lines, &line).map_err(|err| err.to_string())?;
+    lines.push(b'\n');
+    Ok(())
+}
+
+/// Write a serialized snapshot to a new temporary file in `dir`, outside the
+/// node lock; `Inner::place_snapshot_file` then renames it into place.
+fn save_snapshot_file(dir: &Path, id: u64, text: &str) -> Result<PathBuf, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!("{id}.snapshot.json.tmp{n}"));
+    std::fs::write(&tmp, text).map_err(|err| err.to_string())?;
+    Ok(tmp)
+}
+
 fn parse_snapshot(value: &Value) -> Option<Snapshot> {
     Some(Snapshot {
         index: u64_field(value, "index")? as usize,
@@ -2318,4 +2607,41 @@ fn parse_entry(value: &Value) -> Option<Entry> {
         _ => return None,
     };
     Some(Entry { term, command })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Snapshot::to_text` writes the key space by hand; it must read back
+    /// as the same snapshot, whatever the keys hold.
+    #[test]
+    fn snapshot_text_round_trips() {
+        let data: KeySpace = [
+            ("plain", json!({"v": 1})),
+            ("quote\" back\\slash", json!({"nested": [1, "two", null]})),
+            ("newline\n tab\t unicode é 🦀", json!({})),
+            ("", json!({"empty key": true})),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect();
+        let snapshot = Snapshot {
+            index: 42,
+            term: 7,
+            config_index: 3,
+            membership: Membership {
+                voters: vec![Peer { id: 1, addr: "127.0.0.1:1".into() }],
+                learners: vec![Peer { id: 2, addr: "127.0.0.1:2".into() }],
+            },
+            data,
+        };
+        let text = snapshot.to_text();
+        let parsed = parse_snapshot(&serde_json::from_str(&text).unwrap()).unwrap();
+        assert_eq!(parsed.index, 42);
+        assert_eq!(parsed.term, 7);
+        assert_eq!(parsed.config_index, 3);
+        assert_eq!(parsed.membership, snapshot.membership);
+        assert_eq!(parsed.data, snapshot.data);
+    }
 }
