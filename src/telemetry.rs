@@ -47,6 +47,10 @@ impl Counter {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn add(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
+    }
+
     pub(crate) fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
@@ -232,6 +236,8 @@ pub(crate) struct Gauges {
     pub(crate) applied_index: usize,
     pub(crate) last_index: usize,
     pub(crate) snapshot_index: usize,
+    /// Highest log index known to be on disk.
+    pub(crate) synced_index: usize,
     /// Log entries held after the log base.
     pub(crate) log_entries: usize,
     pub(crate) voters: usize,
@@ -266,6 +272,8 @@ pub(crate) struct Telemetry {
     pub(crate) snapshots_sent: Counter,
     pub(crate) snapshots_installed: Counter,
     pub(crate) persist_failures: Counter,
+    pub(crate) log_syncs: Counter,
+    pub(crate) entries_synced: Counter,
     pub(crate) forwards_ok: Counter,
     pub(crate) forwards_failed: Counter,
     pub(crate) forwarded_received: Counter,
@@ -305,6 +313,8 @@ impl Telemetry {
             snapshots_sent: Counter::default(),
             snapshots_installed: Counter::default(),
             persist_failures: Counter::default(),
+            log_syncs: Counter::default(),
+            entries_synced: Counter::default(),
             forwards_ok: Counter::default(),
             forwards_failed: Counter::default(),
             forwarded_received: Counter::default(),
@@ -546,6 +556,9 @@ impl Telemetry {
             "read_quorum_failures": self.read_quorum_failures.get(),
             "forwards_failed": self.forwards_failed.get(),
             "persist_failures": self.persist_failures.get(),
+            "log_syncs": self.log_syncs.get(),
+            "entries_synced": self.entries_synced.get(),
+            "synced_index": gauges.synced_index,
             "events_dropped": self.events_dropped.get(),
             "peers": peers,
         })
@@ -621,6 +634,12 @@ impl Telemetry {
             "raft_snapshot_index",
             "Last log index covered by this member's snapshot.",
             gauges.snapshot_index,
+        );
+        gauge(
+            o,
+            "raft_synced_index",
+            "Highest log index known to be on disk (fsynced).",
+            gauges.synced_index,
         );
         gauge(
             o,
@@ -730,6 +749,18 @@ impl Telemetry {
             "raft_persist_failures_total",
             "Failed writes of Raft state to disk.",
             &self.persist_failures,
+        );
+        counter(
+            o,
+            "raft_log_syncs_total",
+            "Log fsyncs by the log writer; each covers a group of entries.",
+            &self.log_syncs,
+        );
+        counter(
+            o,
+            "raft_log_entries_synced_total",
+            "Log entries made durable by the log writer's fsyncs.",
+            &self.entries_synced,
         );
         counter(
             o,

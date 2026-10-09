@@ -95,17 +95,21 @@ fn load(path: &Path) -> Option<Identity> {
     Some(Identity { id, peers })
 }
 
+/// Saved durably: a member that forgot its id after a crash would rejoin
+/// as a stranger holding another member's log.
 fn save(path: &Path, identity: &Identity) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("identity path has no file name"))?;
     let peers: Vec<Value> = identity
         .peers
         .iter()
         .map(|peer| json!({ "id": peer.id, "addr": peer.addr }))
         .collect();
     let body = json!({ "id": identity.id, "peers": peers });
-    std::fs::write(path, serde_json::to_vec(&body).unwrap_or_default())
+    crate::raft::write_durably(dir, name, &serde_json::to_vec(&body).unwrap_or_default())
 }
 
 async fn discover(

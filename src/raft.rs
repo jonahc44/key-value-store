@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 const HEARTBEAT: Duration = Duration::from_millis(40);
@@ -44,6 +44,8 @@ const STATS_INTERVAL: Duration = Duration::from_secs(60);
 const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_SNAPSHOT_EVERY: usize = 8192;
 pub const DEFAULT_SNAPSHOT_CHUNK: usize = 1 << 20;
+/// Pause before the log writer retries after a failed write.
+const FLUSH_RETRY: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
@@ -189,7 +191,7 @@ impl SnapshotJob {
                 encode_log_line(&mut lines, slot, self.base, entry)?;
             }
             let tmp = dir.join(format!("{id}.log.jsonl.compacted"));
-            std::fs::write(&tmp, &lines).map_err(|err| err.to_string())?;
+            write_synced(&tmp, &lines).map_err(|err| err.to_string())?;
             Ok(tmp)
         });
         Saved {
@@ -262,6 +264,20 @@ struct Inner {
     /// holds a truncated suffix, a torn line or an older base, and is
     /// rewritten in full.
     on_disk: usize,
+    /// Highest log index known to be on disk (fsynced); everything, without
+    /// a data dir. Followers acknowledge entries, and a leader counts its own
+    /// copy toward commit, only up to here.
+    synced: usize,
+    synced_tx: watch::Sender<usize>,
+    /// Bumped when the log file is replaced or its tail truncated, so a sync
+    /// of the old file is not taken for the new one.
+    log_epoch: u64,
+    /// The log file, open for appending.
+    log_file: Option<std::fs::File>,
+    /// Commit index last handed to the log writer.
+    saved_commit: usize,
+    /// Wakes the log writer (group commit, see `Node::flush_loop`).
+    flush: Arc<Notify>,
     commit_index: usize,
     last_applied: usize,
     next_index: HashMap<u64, usize>,
@@ -356,8 +372,15 @@ impl Node {
         if inner.is_voter() && inner.membership.voters.len() == 1 {
             inner.current_term = inner.current_term.saturating_add(1).max(1);
             inner.voted_for = Some(inner.id);
-            inner.become_leader();
+            // If the term cannot be saved, the election timer tries again.
+            if inner.save_hard_state() {
+                inner.become_leader();
+                // Commit the no-op before serving, so a lone member is
+                // readable as soon as it starts; nothing waits on the lock yet.
+                inner.flush_now();
+            }
         }
+        let flush = Arc::clone(&inner.flush);
 
         tracing::info!(
             node = inner.id,
@@ -379,6 +402,7 @@ impl Node {
         tokio::spawn(async move { ticker.tick_loop().await });
         tokio::spawn(Self::stats_loop(Arc::downgrade(&node)));
         tokio::spawn(Self::snapshot_loop(Arc::downgrade(&node), pending_snapshots));
+        tokio::spawn(Self::flush_loop(Arc::downgrade(&node), flush));
         node
     }
 
@@ -402,6 +426,40 @@ impl Node {
     pub(crate) async fn metrics_text(&self) -> String {
         let gauges = self.inner.lock().await.gauges();
         self.telemetry.render(&gauges)
+    }
+
+    /// The log writer, with group commit: under the node lock, write every
+    /// entry added since the last round to the log file; outside it, make
+    /// them all durable with one fsync while new entries pile up for the next
+    /// round. Repeats until nothing is pending.
+    async fn flush_loop(node: std::sync::Weak<Self>, flush: Arc<Notify>) {
+        loop {
+            flush.notified().await;
+            let Some(this) = node.upgrade() else {
+                break;
+            };
+            while this.running.load(Ordering::Relaxed) {
+                let begun = this.inner.lock().await.begin_flush();
+                let pending = match begun {
+                    Ok(Some(pending)) => pending,
+                    Ok(None) => break,
+                    Err(err) => {
+                        tracing::error!(node = this.id, %err, "failed to write raft log; retrying");
+                        tokio::time::sleep(FLUSH_RETRY).await;
+                        continue;
+                    }
+                };
+                let synced = tokio::task::spawn_blocking(move || {
+                    let result = pending.complete();
+                    (pending, result)
+                })
+                .await;
+                match synced {
+                    Ok((pending, result)) => this.inner.lock().await.end_flush(&pending, result),
+                    Err(err) => tracing::error!(node = this.id, %err, "log writer failed"),
+                }
+            }
+        }
     }
 
     /// Serialize and save the snapshots `maybe_compact` captures, off the
@@ -753,17 +811,23 @@ impl Node {
             inner.observe_term(term);
         }
         let can_vote = inner.voted_for.is_none() || inner.voted_for == Some(candidate);
-        let granted = can_vote
+        let mut granted = can_vote
             && log_up_to_date(
                 inner.last_term(),
                 inner.last_index() as u64,
                 last_term,
                 last_index,
             );
+        if granted && inner.voted_for != Some(candidate) {
+            // A vote is cast only once it is saved.
+            let previous = inner.voted_for.replace(candidate);
+            if !inner.save_hard_state() {
+                inner.voted_for = previous;
+                granted = false;
+            }
+        }
         if granted {
-            inner.voted_for = Some(candidate);
             inner.refresh_follower_timer();
-            inner.persist();
             tracing::info!(
                 node = inner.id,
                 candidate,
@@ -876,6 +940,7 @@ impl Node {
                     let keep = index - inner.log_base;
                     inner.log.truncate(keep);
                     inner.persisted = inner.persisted.min(keep);
+                    inner.log_changed(index);
                     inner.log.push(entry.into());
                     dirty = true;
                     membership_changed = true;
@@ -903,7 +968,30 @@ impl Node {
             dirty = true;
         }
         if dirty {
-            inner.persist();
+            inner.request_flush();
+        }
+        // Success vouches for the log through the last entry sent, so those
+        // entries must be on disk first: wait for the log writer, which syncs
+        // whatever has piled up in one go.
+        let matched = prev_index + entries.len();
+        if inner.synced < matched {
+            let mut synced = inner.synced_tx.subscribe();
+            drop(inner);
+            // The watch borrow ends with this statement, before the node
+            // lock is taken again; the log writer holds that lock to publish.
+            let durable = matches!(
+                tokio::time::timeout(net::RPC_TIMEOUT, synced.wait_for(|synced| *synced >= matched)).await,
+                Ok(Ok(_))
+            );
+            inner = self.inner.lock().await;
+            // A newer leader may have replaced the entries meanwhile.
+            if !durable || inner.current_term != term {
+                return json!({
+                    "term": inner.current_term,
+                    "success": false,
+                    "next_index": inner.synced + 1
+                });
+            }
         }
         json!({
             "term": inner.current_term,
@@ -1017,7 +1105,7 @@ impl Node {
         }
         let keys = snapshot.data.len();
         inner.restore(snapshot, text);
-        inner.persist();
+        inner.request_flush();
         tracing::info!(node = inner.id, leader = leader_id, index, keys, "installed snapshot");
         inner.telemetry.snapshots_installed.inc();
         inner.telemetry.event(
@@ -1217,7 +1305,9 @@ impl Node {
             if inner.quorum() <= 1 {
                 inner.current_term = inner.current_term.saturating_add(1).max(1);
                 inner.voted_for = Some(inner.id);
-                inner.become_leader();
+                if inner.save_hard_state() {
+                    inner.become_leader();
+                }
                 return;
             }
             Campaign {
@@ -1305,7 +1395,11 @@ impl Node {
             inner.voted_for = Some(inner.id);
             inner.votes = 1;
             inner.leader_id = None;
-            inner.persist();
+            // The vote for itself must be saved before asking for others.
+            if !inner.save_hard_state() {
+                inner.role = Role::Follower;
+                return;
+            }
             json!({
                 "term": inner.current_term,
                 "candidate_id": inner.id,
@@ -1748,6 +1842,12 @@ impl Inner {
             snapshot_chunk,
             persisted: 0,
             on_disk: 0,
+            synced: 0,
+            synced_tx: watch::Sender::new(0),
+            log_epoch: 0,
+            log_file: None,
+            saved_commit: 0,
+            flush: Arc::new(Notify::new()),
             commit_index: 0,
             last_applied: 0,
             next_index: HashMap::new(),
@@ -1792,6 +1892,7 @@ impl Inner {
             applied_index: self.last_applied,
             last_index: self.last_index(),
             snapshot_index: self.snapshot_index,
+            synced_index: self.synced,
             log_entries: self.log.len() - 1,
             voters: self.membership.voters.len(),
             learners: self.membership.learners.len(),
@@ -1851,7 +1952,7 @@ impl Inner {
         }
         let (tx, rx) = oneshot::channel();
         self.waiters.insert(index, tx);
-        self.persist();
+        self.request_flush();
         self.advance_commit();
         (index, rx)
     }
@@ -2038,7 +2139,7 @@ impl Inner {
         self.last_heartbeat_sent = now;
         self.last_quorum_ok = now;
         self.advance_commit();
-        self.persist();
+        self.request_flush();
         tracing::info!(node = self.id, term = self.current_term, "became leader");
     }
 
@@ -2100,7 +2201,7 @@ impl Inner {
         self.election_timeout = random_timeout(self.id);
         self.election_deadline = Instant::now() + self.election_timeout;
         self.fail_uncommitted();
-        self.persist();
+        self.save_hard_state();
     }
 
     fn fail_uncommitted(&mut self) {
@@ -2135,7 +2236,9 @@ impl Inner {
             if self.entry(index).term != self.current_term {
                 continue;
             }
-            let mut replicas = usize::from(self.is_voter());
+            // The leader's own copy counts once it is on disk; it writes in
+            // parallel with replication (Raft thesis §10.2.1).
+            let mut replicas = usize::from(self.is_voter() && self.synced >= index);
             for voter in &self.membership.voters {
                 if voter.id != self.id
                     && self.match_index.get(&voter.id).is_some_and(|m| *m >= index)
@@ -2156,7 +2259,7 @@ impl Inner {
             );
             self.commit_index = commit;
             self.apply();
-            self.persist();
+            self.request_flush();
         }
     }
 
@@ -2284,10 +2387,14 @@ impl Inner {
         self.next_snapshot_at = index + self.snapshot_every;
         self.offer_snapshot_text(index, saved.text);
         match log_placed {
-            Ok(()) => {
+            // The new file holds the whole log, synced.
+            Ok(()) if saved.log_file.is_some() => {
+                self.log_changed(self.last_index() + 1);
                 self.persisted = self.log.len();
                 self.on_disk = self.log.len();
+                self.note_synced(self.last_index());
             }
+            Ok(()) => {}
             Err(err) => {
                 // Rewrite it here instead, under the lock.
                 tracing::warn!(node = self.id, index, %err, "failed to prepare compacted log; rewriting it");
@@ -2296,7 +2403,7 @@ impl Inner {
                 }
                 self.persisted = 0;
                 self.on_disk = usize::MAX;
-                self.persist();
+                self.flush_now();
             }
         }
         tracing::info!(node = self.id, index, log_base = base, keys = self.data.len(), "took snapshot");
@@ -2309,20 +2416,22 @@ impl Inner {
     }
 
     /// Append the entries after `index` to `tmp`, the compacted log the
-    /// background writer started from `base` up to `index`, and put it in
-    /// place of the log file.
+    /// background writer started from `base` up to `index` and synced, and
+    /// put it in place of the log file, synced: one fsync per compaction.
     fn complete_log_file(&self, tmp: &Path, base: usize, index: usize) -> Result<(), String> {
         use std::io::Write;
         let mut lines = Vec::new();
         for at in (index + 1)..=self.last_index() {
             encode_log_line(&mut lines, at - base, base, self.entry(at))?;
         }
-        let path = tmp.with_file_name(format!("{}.log.jsonl", self.id));
+        let dir = tmp.parent().unwrap_or(Path::new("."));
+        let path = dir.join(format!("{}.log.jsonl", self.id));
         std::fs::OpenOptions::new()
             .append(true)
             .open(tmp)
-            .and_then(|mut file| file.write_all(&lines))
+            .and_then(|mut file| file.write_all(&lines).and_then(|()| file.sync_data()))
             .and_then(|()| std::fs::rename(tmp, &path))
+            .and_then(|()| sync_dir(dir))
             .map_err(|err| err.to_string())
     }
 
@@ -2350,10 +2459,13 @@ impl Inner {
 
     /// Replace the snapshot file with `tmp`, written by `save_snapshot_file`.
     /// Done under the node lock, so the file and the log base change in step.
+    /// `tmp` is already synced, so only the rename needs saving.
     fn place_snapshot_file(&self, tmp: &Path) -> Result<(), String> {
         let dir = tmp.parent().unwrap_or(Path::new("."));
         let path = dir.join(format!("{}.snapshot.json", self.id));
-        std::fs::rename(tmp, &path).map_err(|err| err.to_string())
+        std::fs::rename(tmp, &path)
+            .and_then(|()| sync_dir(dir))
+            .map_err(|err| err.to_string())
     }
 
     fn read_snapshot(&self, dir: &Path) -> Option<(Snapshot, Arc<String>)> {
@@ -2391,85 +2503,195 @@ impl Inner {
         self.commit_index = self.commit_index.max(snapshot.index);
         self.persisted = 0;
         self.on_disk = usize::MAX;
+        // Durable through the snapshot until the log file is rewritten.
+        self.log_epoch += 1;
+        self.log_file = None;
+        self.synced = snapshot.index;
+        self.synced_tx.send_replace(self.synced);
         self.refresh_membership();
     }
 
-    fn persist(&mut self) {
-        if self.data_dir.is_none() {
-            return;
-        }
-        let started = Instant::now();
-        let result = self.write_state();
-        self.telemetry
-            .record_persist(started.elapsed(), result.is_ok(), result.err().as_deref());
-    }
-
-    /// Save the log, then term, vote and commit index. The log file is
-    /// appended to, one JSON entry per line, so a persist costs the new
-    /// entries rather than the whole log; it is rewritten only after a
-    /// truncation or a compaction. Its first line is the entry at `log_base`,
-    /// as a noop carrying the base (absent, in files from before compaction,
-    /// for base 0). Entries go first so a saved commit index never points
-    /// past the saved log.
-    fn write_state(&mut self) -> Result<(), String> {
+    /// Save the term and vote, durably, before acting on them: a vote that
+    /// a crash forgets could be cast twice in one term. Rare, so done in
+    /// place. False if they could not be saved.
+    fn save_hard_state(&mut self) -> bool {
         let Some(dir) = self.data_dir.clone() else {
-            return Ok(());
+            return true;
         };
-        if let Err(err) = std::fs::create_dir_all(&dir) {
-            tracing::error!(node = self.id, path = %dir.display(), %err, "failed to create data dir");
-            return Err(err.to_string());
-        }
-        self.write_log(&dir)?;
-        let path = dir.join(format!("{}.json", self.id));
-        let tmp = dir.join(format!("{}.json.tmp", self.id));
+        let started = Instant::now();
         let body = json!({
             "current_term": self.current_term,
             "voted_for": self.voted_for,
-            "commit_index": self.commit_index,
         });
         let bytes = serde_json::to_vec(&body).unwrap_or_default();
-        if let Err(err) = std::fs::write(&tmp, &bytes) {
-            tracing::error!(node = self.id, path = %tmp.display(), %err, "failed to write raft state");
-            return Err(err.to_string());
+        let result = write_durably(&dir, &format!("{}.json", self.id), &bytes)
+            .map_err(|err| err.to_string());
+        if let Err(err) = &result {
+            tracing::error!(node = self.id, %err, "failed to save term and vote");
         }
-        if let Err(err) = std::fs::rename(&tmp, &path) {
-            tracing::error!(node = self.id, path = %path.display(), %err, "failed to replace raft state");
-            return Err(err.to_string());
-        }
-        Ok(())
+        self.telemetry
+            .record_persist(started.elapsed(), result.is_ok(), result.as_ref().err().map(String::as_str));
+        result.is_ok()
     }
 
-    fn write_log(&mut self, dir: &Path) -> Result<(), String> {
-        use std::io::Write;
-        let path = dir.join(format!("{}.log.jsonl", self.id));
+    /// Have the log writer save new entries and the commit index. Without a
+    /// data dir there is nothing to wait for.
+    fn request_flush(&mut self) {
+        if self.data_dir.is_some() {
+            self.flush.notify_one();
+        } else {
+            self.note_synced(self.last_index());
+        }
+    }
+
+    /// The log through `index` is on disk. A leader counts its own copy of
+    /// an entry toward commit only from here.
+    fn note_synced(&mut self, index: usize) {
+        let index = index.min(self.last_index());
+        if index > self.synced {
+            self.synced = index;
+            self.synced_tx.send_replace(index);
+            self.advance_commit();
+        }
+    }
+
+    /// Entries from `index` on are gone from the log, or the log file is
+    /// being replaced; a flush in flight no longer speaks for the file.
+    fn log_changed(&mut self, index: usize) {
+        self.log_epoch += 1;
+        self.log_file = None;
+        if self.synced >= index {
+            self.synced = index.saturating_sub(1);
+            self.synced_tx.send_replace(self.synced);
+        }
+    }
+
+    /// Group commit, first half, under the node lock: write the entries
+    /// added since the last flush to the log file, without syncing. The log
+    /// file is appended to, one JSON entry per line, so a flush costs the new
+    /// entries rather than the whole log. Its first line is the entry at
+    /// `log_base`, as a noop carrying the base (absent, in files from before
+    /// compaction, for base 0). After a truncation, a snapshot install or a
+    /// failed write the file is instead rewritten, and synced, here.
+    fn begin_flush(&mut self) -> Result<Option<Flush>, String> {
+        let Some(dir) = self.data_dir.clone() else {
+            return Ok(None);
+        };
+        let started = Instant::now();
         let rewrite = self.on_disk > self.persisted;
         let from = if rewrite { 0 } else { self.persisted };
-        if from == self.log.len() && !rewrite {
-            return Ok(());
+        let commit = (self.commit_index != self.saved_commit).then_some(self.commit_index);
+        if from == self.log.len() && commit.is_none() {
+            return Ok(None);
         }
         let mut lines = Vec::new();
         for (slot, entry) in self.log.iter().enumerate().skip(from) {
             encode_log_line(&mut lines, slot, self.log_base, entry)?;
         }
-        let result = if rewrite {
-            let tmp = dir.join(format!("{}.log.jsonl.tmp", self.id));
-            std::fs::write(&tmp, &lines).and_then(|()| std::fs::rename(&tmp, &path))
-        } else {
-            std::fs::OpenOptions::new()
+        let name = format!("{}.log.jsonl", self.id);
+        let mut file = None;
+        let mut entries = 0;
+        if rewrite {
+            let result = write_durably(&dir, &name, &lines).map_err(|err| err.to_string());
+            if let Err(err) = result {
+                self.on_disk = usize::MAX;
+                self.telemetry.record_persist(started.elapsed(), false, Some(&err));
+                return Err(err);
+            }
+            self.log_changed(self.last_index() + 1);
+            self.persisted = self.log.len();
+            self.on_disk = self.log.len();
+            self.note_synced(self.last_index());
+        } else if from < self.log.len() {
+            let written = self.append_log(&dir, &name, &lines);
+            let handle = match written {
+                Ok(handle) => handle,
+                Err(err) => {
+                    // The file's tail is now unknown; rewrite it in full.
+                    self.log_file = None;
+                    self.on_disk = usize::MAX;
+                    self.telemetry.record_persist(started.elapsed(), false, Some(&err));
+                    return Err(err);
+                }
+            };
+            entries = self.log.len() - from;
+            self.persisted = self.log.len();
+            self.on_disk = self.log.len();
+            file = Some(handle);
+        }
+        if let Some(commit) = commit {
+            self.saved_commit = commit;
+        }
+        Ok(Some(Flush {
+            epoch: self.log_epoch,
+            index: self.last_index(),
+            file,
+            entries,
+            commit: commit.map(|commit| (dir.join(format!("{}.commit.json", self.id)), commit)),
+            started,
+        }))
+    }
+
+    /// Append `lines` to the log file through the open handle, opening it
+    /// first if need be. Returns a handle to sync outside the lock.
+    fn append_log(&mut self, dir: &Path, name: &str, lines: &[u8]) -> Result<std::fs::File, String> {
+        use std::io::Write;
+        if self.log_file.is_none() {
+            let path = dir.join(name);
+            let created = !path.exists();
+            std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+            let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)
-                .and_then(|mut file| file.write_all(&lines))
-        };
-        if let Err(err) = result {
-            tracing::error!(node = self.id, path = %path.display(), %err, rewrite, "failed to write raft log");
-            // The file's tail is now unknown; rewrite it in full next time.
-            self.on_disk = usize::MAX;
-            return Err(err.to_string());
+                .map_err(|err| err.to_string())?;
+            // A new file needs its directory entry saved too.
+            if created {
+                sync_dir(dir).map_err(|err| err.to_string())?;
+            }
+            self.log_file = Some(file);
         }
-        self.persisted = self.log.len();
-        self.on_disk = self.log.len();
-        Ok(())
+        let file = self.log_file.as_mut().expect("opened above");
+        file.write_all(lines).map_err(|err| err.to_string())?;
+        file.try_clone().map_err(|err| err.to_string())
+    }
+
+    /// Group commit, second half, back under the lock: if the log file is
+    /// still the one written to, the entries are durable.
+    fn end_flush(&mut self, flush: &Flush, result: Result<(), String>) {
+        let ok = result.is_ok();
+        self.telemetry
+            .record_persist(flush.started.elapsed(), ok, result.as_ref().err().map(String::as_str));
+        match result {
+            Ok(()) if flush.file.is_some() => {
+                self.telemetry.log_syncs.inc();
+                self.telemetry.entries_synced.add(flush.entries as u64);
+                if flush.epoch == self.log_epoch {
+                    self.note_synced(flush.index);
+                }
+            }
+            Ok(()) => {}
+            Err(err) => {
+                tracing::error!(node = self.id, %err, "failed to sync raft log");
+                if flush.epoch == self.log_epoch {
+                    // What reached the disk is unknown; rewrite it in full.
+                    self.log_file = None;
+                    self.on_disk = usize::MAX;
+                }
+            }
+        }
+    }
+
+    /// Flush and sync at once, for startup.
+    fn flush_now(&mut self) {
+        match self.begin_flush() {
+            Ok(Some(flush)) => {
+                let result = flush.complete();
+                self.end_flush(&flush, result);
+            }
+            Ok(None) => {}
+            Err(err) => tracing::error!(node = self.id, %err, "failed to write raft log"),
+        }
     }
 
     /// Entries from the log file, stopping at the first line that does not
@@ -2501,6 +2723,9 @@ impl Inner {
         let stale = [
             format!("{}.snapshot.json.tmp", self.id),
             format!("{}.log.jsonl.compacted", self.id),
+            format!("{}.log.jsonl.tmp", self.id),
+            format!("{}.json.tmp", self.id),
+            format!("{}.commit.json.tmp", self.id),
         ];
         for file in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let name = file.file_name().to_string_lossy().into_owned();
@@ -2538,7 +2763,15 @@ impl Inner {
         self.voted_for = value.get("voted_for").and_then(|v| v.as_u64());
         self.log = log;
         self.log_base = base;
-        let commit = u64_field(&value, "commit_index").unwrap_or(0) as usize;
+        // The commit index is a hint, saved unsynced apart from the term and
+        // vote (in this file in older versions); without it, the leader
+        // brings this member up to date.
+        let commit = std::fs::read(dir.join(format!("{}.commit.json", self.id)))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|saved| u64_field(&saved, "commit_index"))
+            .or_else(|| u64_field(&value, "commit_index"))
+            .unwrap_or(0) as usize;
         self.commit_index = commit.min(self.last_index());
         self.data.clear();
         self.last_applied = 0;
@@ -2564,6 +2797,24 @@ impl Inner {
             None => {}
         }
         self.commit_index = self.commit_index.min(self.last_index());
+        self.saved_commit = self.commit_index;
+        // What was read may have reached only the page cache before a crash
+        // of the process; make it durable before anything relies on it.
+        if self.on_disk > self.persisted {
+            self.flush_now();
+        } else {
+            let log = dir.join(format!("{}.log.jsonl", self.id));
+            match std::fs::File::open(&log).and_then(|file| file.sync_all()) {
+                Ok(()) => self.synced = self.last_index(),
+                Err(err) => tracing::warn!(node = self.id, %err, "failed to sync raft log"),
+            }
+        }
+        self.synced_tx.send_replace(self.synced);
+        // An older state file still holding the log is superseded by the
+        // log file now written.
+        if value.get("log").is_some() && self.on_disk == self.persisted {
+            self.save_hard_state();
+        }
         self.refresh_membership();
         self.apply();
         tracing::info!(
@@ -2679,6 +2930,61 @@ fn encode_log_line(lines: &mut Vec<u8>, slot: usize, base: usize, entry: &Entry)
     Ok(())
 }
 
+/// Log writes waiting for one fsync, taken outside the node lock.
+struct Flush {
+    /// The log file's epoch when written; a later rewrite supersedes them.
+    epoch: u64,
+    /// Last log index written.
+    index: usize,
+    /// The log file, if entries were appended to it.
+    file: Option<std::fs::File>,
+    entries: usize,
+    /// The commit index and where to record it. It is volatile state, only
+    /// a hint for a faster restart, so it is not synced.
+    commit: Option<(PathBuf, usize)>,
+    started: Instant,
+}
+
+impl Flush {
+    fn complete(&self) -> Result<(), String> {
+        if let Some(file) = &self.file {
+            file.sync_data().map_err(|err| err.to_string())?;
+        }
+        if let Some((path, commit)) = &self.commit {
+            let tmp = path.with_extension("json.tmp");
+            let body = json!({ "commit_index": commit }).to_string();
+            if let Err(err) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path)) {
+                tracing::debug!(%err, "failed to record commit index");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Write `name` in `dir` so that a crash leaves either the old or the new
+/// contents, and the new ones survive power loss once this returns: write a
+/// temporary file, sync it, rename it over, and sync the directory.
+pub(crate) fn write_durably(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!("{name}.tmp"));
+    write_synced(&tmp, bytes)?;
+    std::fs::rename(&tmp, dir.join(name))?;
+    sync_dir(dir)
+}
+
+/// Create `path` with `bytes` and sync it.
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Save a directory's entries: file creations and renames in it.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
 /// Write a serialized snapshot to a new temporary file in `dir`, outside the
 /// node lock; `Inner::place_snapshot_file` then renames it into place.
 fn save_snapshot_file(dir: &Path, id: u64, text: &str) -> Result<PathBuf, String> {
@@ -2686,7 +2992,7 @@ fn save_snapshot_file(dir: &Path, id: u64, text: &str) -> Result<PathBuf, String
     std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!("{id}.snapshot.json.tmp{n}"));
-    std::fs::write(&tmp, text).map_err(|err| err.to_string())?;
+    write_synced(&tmp, text.as_bytes()).map_err(|err| err.to_string())?;
     Ok(tmp)
 }
 

@@ -1020,6 +1020,51 @@ mod tests {
         }
     }
 
+    /// Concurrent writes are made durable together: one fsync covers every
+    /// entry appended while the previous one ran, and what is committed is
+    /// on disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn group_commit_batches_concurrent_writes() {
+        use crate::raft::Command;
+        let dir = std::env::temp_dir().join(format!(
+            "kv-group-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nodes = cluster(1, Some(dir.clone())).await;
+        let node = Arc::clone(&nodes[0].node);
+        let mut writes = Vec::new();
+        for n in 0..400 {
+            let node = Arc::clone(&node);
+            writes.push(tokio::spawn(async move {
+                let command = Command::Put {
+                    key: format!("k{n}"),
+                    value: json!({ "n": n }),
+                };
+                node.propose(command).await.is_ok()
+            }));
+        }
+        for write in writes {
+            assert!(write.await.unwrap());
+        }
+        let addr = &nodes[0].addr;
+        let syncs = metric(addr, "raft_log_syncs_total").await;
+        let synced_entries = metric(addr, "raft_log_entries_synced_total").await;
+        assert!(synced_entries >= 400, "{synced_entries} entries synced");
+        assert!(syncs < synced_entries / 2, "{syncs} fsyncs for {synced_entries} entries");
+        assert!(metric(addr, "raft_synced_index").await >= metric(addr, "raft_commit_index").await);
+        nodes.into_iter().next().unwrap().stop().await;
+
+        // Committed writes survive a restart.
+        let nodes = cluster(1, Some(dir.clone())).await;
+        assert_eq!(nodes[0].node.local_get("k399").await, Some(json!({"n": 399})));
+        nodes.into_iter().next().unwrap().stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A member collects snapshot chunks in order and reports how much it
     /// holds, so a leader resumes after a gap or a repeat, and installs the
     /// snapshot only on the last chunk.
@@ -1091,7 +1136,8 @@ mod tests {
 
     /// How long writes stall while a large key space is snapshotted. Grows a
     /// single member to KV_BENCH_KEYS distinct keys (default 300000) with a
-    /// snapshot every third of that, and reports write latency.
+    /// snapshot every third of that, and reports write latency. The data
+    /// dir is under TMPDIR; point it at a real disk to include fsync costs.
     ///
     ///     cargo test --release --lib snapshot_stall -- --ignored --nocapture
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1107,7 +1153,12 @@ mod tests {
             .ok()
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(keys / 3);
-        let writers = 32;
+        // KV_BENCH_WRITERS concurrent writers (default 32); 1 shows the cost
+        // of each write's own fsync, more show group commit.
+        let writers: usize = std::env::var("KV_BENCH_WRITERS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(32);
         let dir = std::env::temp_dir().join(format!("kv-stall-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let nodes = cluster_with(1, Some(dir.clone()), snapshot_every).await;

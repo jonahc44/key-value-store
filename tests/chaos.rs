@@ -824,9 +824,17 @@ fn check_logs(dir: &Path, ids: &[u64]) -> (usize, Vec<String>) {
             None => return (0, vec![format!("node {id} left no readable state at {}", path.display())]),
         }
     }
+    // The commit index is in ID.commit.json, or in ID.json in older versions.
     let commit = states
         .iter()
-        .map(|(_, state)| state["commit_index"].as_u64().unwrap_or(0) as usize)
+        .map(|(id, state)| {
+            std::fs::read(dir.join(format!("{id}.commit.json")))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|saved| saved["commit_index"].as_u64())
+                .or_else(|| state["commit_index"].as_u64())
+                .unwrap_or(0) as usize
+        })
         .min()
         .unwrap_or(0);
     // The log is in ID.log.jsonl, one entry per line (a line torn by a kill

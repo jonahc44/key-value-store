@@ -137,6 +137,12 @@ fn usage() -> &'static str {
      in chunks of up to --snapshot-chunk bytes (default 1048576); a transfer\n\
      cut short resumes from the last chunk the member received.\n\
      \n\
+     With --data-dir, state survives power loss, not just a crash: a write is\n\
+     acknowledged only once a majority has fsynced it, and the term and vote\n\
+     are fsynced before a member votes. Concurrent writes share an fsync\n\
+     (group commit), so throughput holds up while each write waits about\n\
+     one disk flush.\n\
+     \n\
      With --data-dir, events and a stats snapshot every minute are also\n\
      appended to DATA_DIR/ID.events.jsonl for analysis over time.\n\
      \n\
