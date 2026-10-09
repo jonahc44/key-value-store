@@ -1,4 +1,4 @@
-use key_value_store::{Peer, ServerConfig, serve};
+use key_value_store::{Options, run};
 
 #[tokio::main]
 async fn main() {
@@ -10,7 +10,7 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(err) = serve(config).await {
+    if let Err(err) = run(config).await {
         eprintln!("server error: {err}");
         std::process::exit(1);
     }
@@ -25,9 +25,8 @@ fn init_tracing() {
         .ok();
 }
 
-fn parse_args() -> Result<ServerConfig, String> {
+fn parse_args() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
-    let mut id = 1u64;
     let mut listen = "127.0.0.1:2379".to_string();
     let mut peers = Vec::new();
     let mut data_dir = None;
@@ -39,11 +38,7 @@ fn parse_args() -> Result<ServerConfig, String> {
                 std::process::exit(0);
             }
             "--id" => {
-                id = args
-                    .next()
-                    .ok_or_else(|| "--id needs a number".to_string())?
-                    .parse()
-                    .map_err(|_| "--id needs a number".to_string())?;
+                return Err("--id was removed: node ids are now assigned at random".to_string());
             }
             "--listen" => {
                 listen = args
@@ -51,22 +46,16 @@ fn parse_args() -> Result<ServerConfig, String> {
                     .ok_or_else(|| "--listen needs an address".to_string())?;
             }
             "--peer" => {
-                let raw = args
+                let addr = args
                     .next()
-                    .ok_or_else(|| "--peer needs ID=ADDR".to_string())?;
-                let (id_text, addr) = raw
-                    .split_once('=')
-                    .ok_or_else(|| "--peer must look like ID=HOST:PORT".to_string())?;
-                let peer_id = id_text
-                    .parse()
-                    .map_err(|_| format!("bad peer id in {raw}"))?;
-                if addr.is_empty() {
-                    return Err(format!("missing address in {raw}"));
+                    .filter(|addr| !addr.is_empty())
+                    .ok_or_else(|| "--peer needs an address".to_string())?;
+                if addr.contains('=') {
+                    return Err(format!(
+                        "--peer takes HOST:PORT only; ids are assigned at random (got {addr})"
+                    ));
                 }
-                peers.push(Peer {
-                    id: peer_id,
-                    addr: addr.to_string(),
-                });
+                peers.push(addr);
             }
             "--data-dir" => {
                 data_dir = Some(
@@ -87,8 +76,7 @@ fn parse_args() -> Result<ServerConfig, String> {
     if join.is_some() && !peers.is_empty() {
         return Err("--join and --peer cannot be combined".to_string());
     }
-    Ok(ServerConfig {
-        id,
+    Ok(Options {
         listen,
         peers,
         data_dir,
@@ -97,14 +85,18 @@ fn parse_args() -> Result<ServerConfig, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: key-value-store [--id N] [--listen ADDR] [--peer ID=ADDR]... [--join ADDR] [--data-dir PATH]\n\
+    "usage: key-value-store [--listen ADDR] [--peer ADDR]... [--join ADDR] [--data-dir PATH]\n\
      \n\
      One process is one member of a Raft cluster. To bootstrap a cluster, pass\n\
      every initial member, including this one, via --peer. With no --peer flags\n\
      the process is a one-node cluster.\n\
      \n\
-     To grow a running cluster, start a new process with a fresh id and\n\
-     --join ADDR, where ADDR is any existing member. It joins as a non-voting\n\
+     Each member picks a random id on first start and logs it. Bootstrap\n\
+     members learn each other's ids from their --peer addresses, so they wait\n\
+     until every peer is up. With --data-dir, the id and peers are saved in\n\
+     DATA_DIR/LISTEN.node.json and reused on restart.\n\
+     \n\
+     To grow a running cluster, start a new process with --join ADDR, where ADDR is any existing member. It joins as a non-voting\n\
      learner, receives the log, and is promoted to voter once caught up.\n\
      --listen must be an address the other members can reach. After the first\n\
      membership change, the log, not --peer, defines the cluster.\n\
@@ -113,6 +105,7 @@ fn usage() -> &'static str {
      PUT    /{key}   JSON object body, 201 once a majority commits it\n\
      DELETE /{key}   204 once a majority commits the delete\n\
      \n\
+     GET    /cluster/id        {\"id\": N} for this member\n\
      GET    /cluster/members   this member's view of voters and learners\n\
      POST   /cluster/members   {\"id\": N, \"addr\": \"HOST:PORT\"} adds a member\n\
      GET    /cluster/metrics   Prometheus metrics for this member and its peers\n\

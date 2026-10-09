@@ -3,12 +3,14 @@
 //! after a majority has accepted the leader. Members can be added at runtime.
 
 mod api;
+mod identity;
 mod net;
 mod raft;
 mod telemetry;
 
 use raft::{Config, Node};
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,8 +18,44 @@ pub use raft::{Config as ServerConfig, Peer};
 
 const JOIN_RETRY: Duration = Duration::from_millis(500);
 
+/// Command line settings. Unlike [`ServerConfig`], no ids are given: this
+/// member picks its own and learns its peers' ids from their addresses.
+#[derive(Clone, Debug)]
+pub struct Options {
+    pub listen: String,
+    pub peers: Vec<String>,
+    pub data_dir: Option<PathBuf>,
+    pub join: Option<String>,
+}
+
+/// Resolve this member's id (random on first start, saved under the data
+/// dir), learn the bootstrap peers' ids, then serve.
+pub async fn run(options: Options) -> std::io::Result<()> {
+    let listener = std::net::TcpListener::bind(&options.listen)?;
+    listener.set_nonblocking(true)?;
+    let identity = identity::resolve(
+        &listener,
+        &options.listen,
+        &options.peers,
+        options.data_dir.as_ref(),
+    )
+    .await?;
+    let config = Config {
+        id: identity.id,
+        listen: options.listen,
+        peers: identity.peers,
+        data_dir: options.data_dir,
+        join: options.join,
+    };
+    serve_on(tokio::net::TcpListener::from_std(listener)?, config).await
+}
+
 pub async fn serve(config: Config) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.listen).await?;
+    serve_on(listener, config).await
+}
+
+async fn serve_on(listener: tokio::net::TcpListener, config: Config) -> std::io::Result<()> {
     let addr = listener.local_addr()?;
     let members = if config.peers.is_empty() {
         1
@@ -381,7 +419,10 @@ mod tests {
     async fn node_added_at_runtime_becomes_voter() {
         let mut nodes = cluster(3, None).await;
         let leader = wait_leader(&nodes).await;
-        assert_eq!(put(&nodes[leader].addr, "early", json!({"v": 1})).await.0, 201);
+        assert_eq!(
+            put(&nodes[leader].addr, "early", json!({"v": 1})).await.0,
+            201
+        );
 
         // Go through a follower so the request is forwarded to the leader.
         let seed = nodes[(leader + 1) % nodes.len()].addr.clone();
@@ -508,7 +549,10 @@ mod tests {
         let removed = &nodes[first].node;
         let start = Instant::now();
         while voters(removed).await.contains(&first_id) {
-            assert!(start.elapsed() < Duration::from_secs(3), "node {first_id} never learned it was removed");
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "node {first_id} never learned it was removed"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(!events_of(removed, "removed_from_cluster").await.is_empty());
@@ -579,7 +623,10 @@ mod tests {
         let next = wait_leader(&nodes).await;
         assert!(!old.node.is_leader().await);
         let stepped = events_of(&old.node, "stepped_down").await;
-        assert!(stepped.iter().any(|event| event["reason"] == "removed"), "{stepped:?}");
+        assert!(
+            stepped.iter().any(|event| event["reason"] == "removed"),
+            "{stepped:?}"
+        );
         let transferred = events_of(&old.node, "leadership_transferred").await;
         assert_eq!(
             transferred.last().map(|event| event["target"].as_u64()),

@@ -8,7 +8,6 @@ use tokio::net::TcpStream;
 
 pub const RPC_TIMEOUT: Duration = Duration::from_millis(300);
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn call(
     addr: &str,
     method: &str,
