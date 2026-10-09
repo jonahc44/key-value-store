@@ -32,8 +32,9 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/raft/request-vote", post(request_vote))
         .route("/raft/append-entries", post(append_entries))
         .route("/raft/timeout-now", post(timeout_now))
-        // A snapshot carries the whole key space, so it is exempt from the
-        // default 2 MB body limit.
+        // Snapshot chunks are sized by the leader's --snapshot-chunk, and
+        // JSON escaping can grow one several times, so the default 2 MB body
+        // limit does not apply.
         .route(
             "/raft/install-snapshot",
             post(install_snapshot).layer(DefaultBodyLimit::disable()),

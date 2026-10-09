@@ -1,4 +1,4 @@
-use key_value_store::{DEFAULT_SNAPSHOT_EVERY, Options, run};
+use key_value_store::{DEFAULT_SNAPSHOT_CHUNK, DEFAULT_SNAPSHOT_EVERY, Options, run};
 
 #[tokio::main]
 async fn main() {
@@ -32,6 +32,7 @@ fn parse_args() -> Result<Options, String> {
     let mut data_dir = None;
     let mut join = None;
     let mut snapshot_every = DEFAULT_SNAPSHOT_EVERY;
+    let mut snapshot_chunk = DEFAULT_SNAPSHOT_CHUNK;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -77,6 +78,13 @@ fn parse_args() -> Result<Options, String> {
                     .and_then(|n| n.parse().ok())
                     .ok_or_else(|| "--snapshot-every needs a number of entries".to_string())?;
             }
+            "--snapshot-chunk" => {
+                snapshot_chunk = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| "--snapshot-chunk needs a positive number of bytes".to_string())?;
+            }
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
     }
@@ -89,12 +97,13 @@ fn parse_args() -> Result<Options, String> {
         data_dir,
         join,
         snapshot_every,
+        snapshot_chunk,
     })
 }
 
 fn usage() -> &'static str {
     "usage: key-value-store [--listen ADDR] [--peer ADDR]... [--join ADDR] [--data-dir PATH]\n\
-                       [--snapshot-every N]\n\
+                       [--snapshot-every N] [--snapshot-chunk BYTES]\n\
      \n\
      One process is one member of a Raft cluster. To bootstrap a cluster, pass\n\
      every initial member, including this one, via --peer. With no --peer flags\n\
@@ -124,7 +133,9 @@ fn usage() -> &'static str {
      8192; 0 never compacts) a member snapshots its keys and drops the log\n\
      before them, so memory, disk and restart time track the key space\n\
      rather than the write history. With --data-dir the snapshot is saved in\n\
-     DATA_DIR/ID.snapshot.json. A member too far behind gets the snapshot.\n\
+     DATA_DIR/ID.snapshot.json. A member too far behind gets the snapshot,\n\
+     in chunks of up to --snapshot-chunk bytes (default 1048576); a transfer\n\
+     cut short resumes from the last chunk the member received.\n\
      \n\
      With --data-dir, events and a stats snapshot every minute are also\n\
      appended to DATA_DIR/ID.events.jsonl for analysis over time.\n\

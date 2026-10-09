@@ -21,7 +21,9 @@
 //! (8), CHAOS_MAX_DOWN (members out at once; the default keeps a majority up,
 //! larger values allow full outages), CHAOS_SNAPSHOT_EVERY (500 applied entries
 //! between snapshots, low so that compaction and snapshot installs happen under
-//! faults; 0 never compacts) and CHAOS_SEED. The seed fixes the fault
+//! faults; 0 never compacts), CHAOS_SNAPSHOT_CHUNK (4096 bytes per snapshot
+//! request, small so transfers span many requests and kills land mid-transfer)
+//! and CHAOS_SEED. The seed fixes the fault
 //! and client decisions, not thread timing, so a rerun is similar, not
 //! identical. The data directory (raft state keyed by the random node ids
 //! printed at start, event journals, nodeN.log per member, fault timeline)
@@ -144,6 +146,7 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
         summary["clients"] = json!(settings.clients);
         summary["nodes"] = json!(settings.nodes);
         summary["snapshot_every"] = json!(settings.snapshot_every);
+        summary["snapshot_chunk"] = json!(settings.snapshot_chunk);
         summary["agreed_entries"] = json!(agreed);
         // Raft state is ID.json plus, in newer versions, the ID.log.jsonl log
         // and the ID.snapshot.json snapshot.
@@ -186,6 +189,7 @@ struct Settings {
     clients: u64,
     max_down: usize,
     snapshot_every: usize,
+    snapshot_chunk: usize,
     seed: u64,
     keep: bool,
 }
@@ -201,6 +205,7 @@ impl Settings {
             clients: env_or("CHAOS_CLIENTS", 8),
             max_down: env_or("CHAOS_MAX_DOWN", ((nodes - 1) / 2) as usize),
             snapshot_every: env_or("CHAOS_SNAPSHOT_EVERY", 500),
+            snapshot_chunk: env_or("CHAOS_SNAPSHOT_CHUNK", 4096),
             seed: env_or("CHAOS_SEED", clock % 1_000_000_000),
             keep: env_or("CHAOS_KEEP", 0u8) != 0,
         }
@@ -342,6 +347,7 @@ struct Cluster {
     timeline: Vec<String>,
     unexpected_exits: Vec<String>,
     snapshot_every: usize,
+    snapshot_chunk: usize,
 }
 
 impl Cluster {
@@ -370,6 +376,7 @@ impl Cluster {
             timeline: Vec::new(),
             unexpected_exits: Vec::new(),
             snapshot_every: settings.snapshot_every,
+            snapshot_chunk: settings.snapshot_chunk,
         };
         for index in 0..cluster.members.len() {
             cluster.spawn(index);
@@ -396,7 +403,9 @@ impl Cluster {
             .arg("--data-dir")
             .arg(&self.dir)
             .arg("--snapshot-every")
-            .arg(self.snapshot_every.to_string());
+            .arg(self.snapshot_every.to_string())
+            .arg("--snapshot-chunk")
+            .arg(self.snapshot_chunk.to_string());
         for peer in self.members.iter().filter(|m| m.n != member.n) {
             command.arg("--peer").arg(&peer.addr);
         }

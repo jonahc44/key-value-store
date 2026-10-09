@@ -43,6 +43,7 @@ const STATS_INTERVAL: Duration = Duration::from_secs(60);
 /// A snapshot carries the whole key space, so it gets longer than an append.
 const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_SNAPSHOT_EVERY: usize = 8192;
+pub const DEFAULT_SNAPSHOT_CHUNK: usize = 1 << 20;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
@@ -61,6 +62,8 @@ pub struct Config {
     /// as many entries are kept before each snapshot, so a follower that is
     /// only briefly behind catches up from the log.
     pub snapshot_every: usize,
+    /// Most bytes of a snapshot sent to a follower in one request.
+    pub snapshot_chunk: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -248,6 +251,10 @@ struct Inner {
     /// This member's latest snapshot, serialized, for followers that need it
     /// when leading. Usable while its index is at or above `log_base`.
     snapshot_cache: Option<(usize, Arc<String>)>,
+    /// Leader only: per peer, the snapshot being sent to it and how many of
+    /// its bytes the peer holds.
+    snapshot_sent: HashMap<u64, (usize, usize)>,
+    snapshot_chunk: usize,
     /// Leading entries of `log` known to match the log file on disk; only
     /// entries past this are appended on the next persist.
     persisted: usize,
@@ -283,11 +290,21 @@ struct Inner {
     telemetry: Arc<Telemetry>,
 }
 
+/// A snapshot arriving from the leader in chunks.
+struct Incoming {
+    index: usize,
+    /// The leader's term; another leader starts its own snapshot over.
+    term: u64,
+    text: String,
+}
+
 pub struct Node {
     id: u64,
     telemetry: Arc<Telemetry>,
     inner: Mutex<Inner>,
     peer_locks: std::sync::Mutex<HashMap<u64, Arc<Mutex<()>>>>,
+    /// Chunks of a snapshot being received, kept apart from the node lock.
+    incoming: Mutex<Option<Incoming>>,
     running: AtomicBool,
 }
 
@@ -317,6 +334,7 @@ impl Node {
             bootstrap,
             config.data_dir,
             config.snapshot_every,
+            config.snapshot_chunk,
             Arc::clone(&telemetry),
         );
         let (jobs, pending_snapshots) = mpsc::unbounded_channel();
@@ -354,6 +372,7 @@ impl Node {
             telemetry,
             inner: Mutex::new(inner),
             peer_locks: std::sync::Mutex::new(HashMap::new()),
+            incoming: Mutex::new(None),
             running: AtomicBool::new(true),
         });
         let ticker = Arc::clone(&node);
@@ -893,19 +912,24 @@ impl Node {
         })
     }
 
-    /// Replace the state machine with the leader's snapshot (Raft §7). The
-    /// log after the snapshot is kept if it agrees with it, as a delayed
-    /// snapshot must not undo entries received since. Parsing and saving the
-    /// key space happen outside the node lock.
+    /// Take one chunk of the leader's snapshot (Raft §7 and thesis §5.1.3).
+    /// The reply says how many bytes of it this member holds, so the leader
+    /// resends from there after a lost or repeated chunk; `installed` means
+    /// the snapshot, or a later state, is in place. Once the last chunk
+    /// arrives the snapshot replaces the state machine; the log after it is
+    /// kept if it agrees with it, as a delayed snapshot must not undo entries
+    /// received since. Collecting, parsing and saving the snapshot happen
+    /// outside the node lock.
     pub(crate) async fn handle_install_snapshot(&self, req: &Value) -> Value {
         let term = u64_field(req, "term").unwrap_or(0);
         let leader_id = u64_field(req, "leader_id").unwrap_or(0);
-        let Some(snapshot) = req.get("snapshot").and_then(parse_snapshot) else {
-            tracing::warn!(node = self.id, leader = leader_id, "unreadable snapshot");
+        let index = u64_field(req, "index").unwrap_or(0) as usize;
+        let offset = u64_field(req, "offset").unwrap_or(0) as usize;
+        let done = req.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
+        let Some(data) = req.get("data").and_then(|v| v.as_str()) else {
             return json!({ "term": term, "success": false });
         };
-        let index = snapshot.index;
-        let dir = {
+        {
             let mut inner = self.inner.lock().await;
             if term < inner.current_term {
                 return json!({ "term": inner.current_term, "success": false });
@@ -914,12 +938,46 @@ impl Node {
             // Committed entries match the leader's, so a snapshot within them
             // adds nothing.
             if index <= inner.commit_index {
-                return json!({ "term": inner.current_term, "success": true });
+                return json!({ "term": term, "success": true, "installed": true });
             }
-            inner.data_dir.clone()
+        }
+
+        let text = {
+            let mut incoming = self.incoming.lock().await;
+            if offset == 0 {
+                *incoming = Some(Incoming {
+                    index,
+                    term,
+                    text: String::new(),
+                });
+            }
+            let same = |held: &&mut Incoming| held.index == index && held.term == term;
+            let Some(held) = incoming.as_mut().filter(same) else {
+                return json!({ "term": term, "success": true, "installed": false, "offset": 0 });
+            };
+            if held.text.len() != offset {
+                let held = held.text.len();
+                return json!({ "term": term, "success": true, "installed": false, "offset": held });
+            }
+            held.text.push_str(data);
+            if !done {
+                let held = held.text.len();
+                return json!({ "term": term, "success": true, "installed": false, "offset": held });
+            }
+            incoming.take().map(|held| held.text).unwrap_or_default()
         };
 
-        let text = Arc::new(req["snapshot"].to_string());
+        let parsed = serde_json::from_str::<Value>(&text)
+            .ok()
+            .as_ref()
+            .and_then(parse_snapshot)
+            .filter(|snapshot| snapshot.index == index);
+        let Some(snapshot) = parsed else {
+            tracing::warn!(node = self.id, leader = leader_id, index, "unreadable snapshot");
+            return json!({ "term": term, "success": false });
+        };
+        let text = Arc::new(text);
+        let dir = self.inner.lock().await.data_dir.clone();
         let file = match dir {
             Some(dir) => {
                 let (id, text) = (self.id, Arc::clone(&text));
@@ -946,7 +1004,7 @@ impl Node {
                 let _ = std::fs::remove_file(tmp);
             }
             let success = inner.current_term == term;
-            return json!({ "term": inner.current_term, "success": success });
+            return json!({ "term": inner.current_term, "success": success, "installed": success });
         }
         // Put in place before the log is rewritten to start at it, so the log
         // file never starts past the saved snapshot.
@@ -966,7 +1024,7 @@ impl Node {
             "snapshot_installed",
             json!({ "index": index, "keys": keys, "leader": leader_id }),
         );
-        json!({ "term": inner.current_term, "success": true })
+        json!({ "term": inner.current_term, "success": true, "installed": true })
     }
 
     async fn tick_loop(self: Arc<Self>) {
@@ -1455,7 +1513,21 @@ impl Node {
                         self.inner.lock().await.offer_snapshot_text(index, Arc::new(text));
                         continue;
                     };
-                    Outbound::Snapshot { index, text }
+                    // Resume where the peer left off if it was getting this
+                    // snapshot already.
+                    let offset = inner
+                        .snapshot_sent
+                        .get(&peer.id)
+                        .filter(|(sent, _)| *sent == index)
+                        .map_or(0, |(_, offset)| *offset)
+                        .min(text.len());
+                    let end = chunk_end(&text, offset, inner.snapshot_chunk);
+                    Outbound::Snapshot {
+                        index,
+                        text,
+                        offset,
+                        end,
+                    }
                 } else {
                     let end = (next + 32).min(last + 1);
                     let entries = (next..end)
@@ -1484,15 +1556,29 @@ impl Node {
                 Outbound::Append { request, .. } => {
                     self.peer_rpc(&peer, "/raft/append-entries", request).await
                 }
-                Outbound::Snapshot { index, text } => {
-                    let body = format!(
-                        r#"{{"term":{term},"leader_id":{},"snapshot":{text}}}"#,
-                        self.id
-                    );
+                Outbound::Snapshot {
+                    index,
+                    text,
+                    offset,
+                    end,
+                } => {
+                    let request = json!({
+                        "term": term,
+                        "leader_id": self.id,
+                        "index": index,
+                        "offset": offset,
+                        "data": &text[*offset..*end],
+                        "done": *end == text.len(),
+                    });
                     // Retried every round while the peer is down, so quiet.
-                    tracing::debug!(node = self.id, peer = peer.id, index, bytes = body.len(), "sending snapshot");
-                    self.peer_post(&peer, "/raft/install-snapshot", body.as_bytes(), SNAPSHOT_RPC_TIMEOUT)
-                        .await
+                    tracing::debug!(node = self.id, peer = peer.id, index, offset, size = text.len(), "sending snapshot chunk");
+                    match serde_json::to_vec(&request) {
+                        Ok(body) => {
+                            self.peer_post(&peer, "/raft/install-snapshot", &body, SNAPSHOT_RPC_TIMEOUT)
+                                .await
+                        }
+                        Err(err) => Err(err.to_string()),
+                    }
                 }
             };
             let response = match result {
@@ -1522,11 +1608,27 @@ impl Node {
             if sent > *acked {
                 *acked = sent;
             }
-            if success {
-                if matches!(request, Outbound::Snapshot { .. }) {
-                    tracing::info!(node = inner.id, peer = peer.id, index = matched, "peer took snapshot");
-                    self.telemetry.snapshots_sent.inc();
+            if let Outbound::Snapshot { index, .. } = &request {
+                if !success {
+                    // The peer could not save it; try again next round.
+                    return RpcOutcome::Unreachable;
                 }
+                let installed = response
+                    .get("installed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !installed {
+                    // The peer says how much of this snapshot it holds, so a
+                    // lost or repeated chunk is resent from the right place.
+                    let held = u64_field(&response, "offset").unwrap_or(0) as usize;
+                    inner.snapshot_sent.insert(peer.id, (*index, held));
+                    continue;
+                }
+                inner.snapshot_sent.remove(&peer.id);
+                tracing::info!(node = inner.id, peer = peer.id, index, "peer took snapshot");
+                self.telemetry.snapshots_sent.inc();
+            }
+            if success {
                 let slot = inner.match_index.entry(peer.id).or_insert(0);
                 if matched > *slot {
                     *slot = matched;
@@ -1551,9 +1653,6 @@ impl Node {
                 {
                     return RpcOutcome::CaughtUp;
                 }
-            } else if matches!(request, Outbound::Snapshot { .. }) {
-                // The peer could not save it; try again next round.
-                return RpcOutcome::Unreachable;
             } else {
                 let cur = (*inner.next_index.get(&peer.id).unwrap_or(&1)).max(1);
                 let hinted = u64_field(&response, "next_index").unwrap_or(1);
@@ -1579,8 +1678,24 @@ impl Node {
 /// One replication RPC to a peer.
 enum Outbound {
     Append { matched: usize, request: Value },
-    /// A serialized snapshot at `index`, sent as `InstallSnapshot`.
-    Snapshot { index: usize, text: Arc<String> },
+    /// Bytes `offset..end` of a serialized snapshot at `index`, sent as
+    /// `InstallSnapshot`.
+    Snapshot {
+        index: usize,
+        text: Arc<String>,
+        offset: usize,
+        end: usize,
+    },
+}
+
+/// End of the snapshot chunk starting at `offset`: about `size` bytes on, on
+/// a character boundary, and past `offset` while any text is left.
+pub(crate) fn chunk_end(text: &str, offset: usize, size: usize) -> usize {
+    let mut end = offset.saturating_add(size.max(1)).min(text.len());
+    while !text.is_char_boundary(end) {
+        end += 1;
+    }
+    end
 }
 
 struct Departing {
@@ -1605,6 +1720,7 @@ impl Inner {
         bootstrap: Membership,
         data_dir: Option<PathBuf>,
         snapshot_every: usize,
+        snapshot_chunk: usize,
         telemetry: Arc<Telemetry>,
     ) -> Self {
         let now = Instant::now();
@@ -1628,6 +1744,8 @@ impl Inner {
             snapshotting: false,
             snapshot_jobs: None,
             snapshot_cache: None,
+            snapshot_sent: HashMap::new(),
+            snapshot_chunk,
             persisted: 0,
             on_disk: 0,
             commit_index: 0,
@@ -1820,6 +1938,7 @@ impl Inner {
             }
             self.next_index.retain(|id, _| targets.contains(id));
             self.match_index.retain(|id, _| targets.contains(id));
+            self.snapshot_sent.retain(|id, _| targets.contains(id));
         }
     }
 
@@ -1889,6 +2008,7 @@ impl Inner {
         self.departing.remove(&id);
         self.next_index.remove(&id);
         self.match_index.remove(&id);
+        self.snapshot_sent.remove(&id);
         self.telemetry.forget_peer(id);
     }
 
@@ -1905,6 +2025,7 @@ impl Inner {
         self.next_index.clear();
         self.match_index.clear();
         self.departing.clear();
+        self.snapshot_sent.clear();
         for peer in self.other_voters().into_iter().chain(self.other_learners()) {
             self.next_index.insert(peer.id, next);
             self.match_index.insert(peer.id, 0);

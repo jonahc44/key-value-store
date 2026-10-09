@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use raft::{Config as ServerConfig, DEFAULT_SNAPSHOT_EVERY, Peer};
+pub use raft::{Config as ServerConfig, DEFAULT_SNAPSHOT_CHUNK, DEFAULT_SNAPSHOT_EVERY, Peer};
 
 const JOIN_RETRY: Duration = Duration::from_millis(500);
 
@@ -28,6 +28,7 @@ pub struct Options {
     pub data_dir: Option<PathBuf>,
     pub join: Option<String>,
     pub snapshot_every: usize,
+    pub snapshot_chunk: usize,
 }
 
 /// Resolve this member's id (random on first start, saved under the data
@@ -49,6 +50,7 @@ pub async fn run(options: Options) -> std::io::Result<()> {
         data_dir: options.data_dir,
         join: options.join,
         snapshot_every: options.snapshot_every,
+        snapshot_chunk: options.snapshot_chunk,
     };
     serve_on(tokio::net::TcpListener::from_std(listener)?, config).await
 }
@@ -130,7 +132,10 @@ mod tests {
     use super::Peer;
     use crate::api;
     use crate::net::call;
-    use crate::raft::{Config, DEFAULT_SNAPSHOT_EVERY, Node};
+    use crate::raft::{Config, DEFAULT_SNAPSHOT_CHUNK, DEFAULT_SNAPSHOT_EVERY, Node};
+
+    /// Small, so test snapshots are sent in many chunks.
+    const TEST_SNAPSHOT_CHUNK: usize = 64;
     use serde_json::json;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -190,6 +195,7 @@ mod tests {
                     data_dir: data_dir.clone(),
                     join: None,
                     snapshot_every,
+                    snapshot_chunk: TEST_SNAPSHOT_CHUNK,
                 },
             ));
         }
@@ -209,6 +215,7 @@ mod tests {
                 data_dir: None,
                 join: Some(seed.to_string()),
                 snapshot_every: DEFAULT_SNAPSHOT_EVERY,
+                snapshot_chunk: DEFAULT_SNAPSHOT_CHUNK,
             },
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -532,6 +539,7 @@ mod tests {
                         data_dir: Some(dir.clone()),
                         join: None,
                         snapshot_every: DEFAULT_SNAPSHOT_EVERY,
+                        snapshot_chunk: DEFAULT_SNAPSHOT_CHUNK,
                     },
                 )
             })
@@ -1010,6 +1018,75 @@ mod tests {
         for node in nodes {
             node.stop().await;
         }
+    }
+
+    /// A member collects snapshot chunks in order and reports how much it
+    /// holds, so a leader resumes after a gap or a repeat, and installs the
+    /// snapshot only on the last chunk.
+    #[tokio::test]
+    async fn snapshot_chunks_resume_and_install() {
+        let nodes = cluster(1, None).await;
+        let addr = nodes[0].addr.clone();
+        let snapshot = json!({
+            "index": 50,
+            "term": 100,
+            "config_index": 0,
+            "voters": [{"id": 1, "addr": addr}],
+            "learners": [],
+            "data": {"a": {"v": 1}, "b": {"v": "é 🦀 \"quoted\""}},
+        })
+        .to_string();
+        let mut chunks = Vec::new();
+        let mut offset = 0;
+        while offset < snapshot.len() {
+            let end = crate::raft::chunk_end(&snapshot, offset, 16);
+            chunks.push((offset, &snapshot[offset..end]));
+            offset = end;
+        }
+        assert!(chunks.len() > 3);
+        let send = |offset: usize, data: &str| {
+            let body = json!({
+                "term": 100,
+                "leader_id": 99,
+                "index": 50,
+                "offset": offset,
+                "data": data,
+                "done": offset + data.len() == snapshot.len(),
+            });
+            let addr = addr.clone();
+            async move {
+                let (_, reply) = call(&addr, "POST", "/raft/install-snapshot", Some(body.to_string().into_bytes()))
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&reply).unwrap()
+            }
+        };
+
+        let reply = send(chunks[0].0, chunks[0].1).await;
+        assert_eq!(reply["installed"], json!(false));
+        assert_eq!(reply["offset"], json!(chunks[1].0));
+        // A gap: the member still asks for the second chunk.
+        let reply = send(chunks[2].0, chunks[2].1).await;
+        assert_eq!(reply["offset"], json!(chunks[1].0));
+        let reply = send(chunks[1].0, chunks[1].1).await;
+        assert_eq!(reply["offset"], json!(chunks[2].0));
+        // A repeat: likewise.
+        let reply = send(chunks[1].0, chunks[1].1).await;
+        assert_eq!(reply["offset"], json!(chunks[2].0));
+        assert_eq!(nodes[0].node.local_get("a").await, None);
+
+        for (offset, data) in &chunks[2..] {
+            let reply = send(*offset, data).await;
+            assert_eq!(reply["success"], json!(true), "{reply}");
+        }
+        let reply = send(0, chunks[0].1).await;
+        assert_eq!(reply["installed"], json!(true), "a stale snapshot is already covered");
+        assert_eq!(nodes[0].node.local_get("a").await, Some(json!({"v": 1})));
+        assert_eq!(
+            nodes[0].node.local_get("b").await,
+            Some(json!({"v": "é 🦀 \"quoted\""}))
+        );
+        nodes.into_iter().next().unwrap().stop().await;
     }
 
     /// How long writes stall while a large key space is snapshotted. Grows a
