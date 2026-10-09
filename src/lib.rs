@@ -458,6 +458,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A new leader learns how far the old one committed only once it commits
+    /// an entry of its own term. Until then its applied state can trail writes
+    /// the old leader acknowledged, so it must not serve reads from it.
+    #[tokio::test]
+    async fn new_leader_does_not_read_before_committing_in_its_term() {
+        let dir = std::env::temp_dir().join(format!(
+            "kv-readindex-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Node 1 holds what the old leader (node 3, never started) committed
+        // with it: k = old, filler, then k = new as the last entry. Node 1 had
+        // only heard of commit 1, so it has applied k = old. Node 2 is empty,
+        // so node 1 spends hundreds of rounds catching it up before its
+        // no-op can commit, while node 2 answers every one of them.
+        let filler = 20_000;
+        let mut log = vec![
+            json!({"term": 0, "op": "noop"}),
+            json!({"term": 1, "op": "put", "key": "k", "value": "old"}),
+        ];
+        log.extend(
+            (0..filler)
+                .map(|n| json!({"term": 1, "op": "put", "key": format!("f{n}"), "value": n})),
+        );
+        log.push(json!({"term": 1, "op": "put", "key": "k", "value": "new"}));
+        let lines: String = log.iter().map(|entry| format!("{entry}\n")).collect();
+        std::fs::write(dir.join("1.log.jsonl"), lines).unwrap();
+        std::fs::write(
+            dir.join("1.json"),
+            json!({"current_term": 1, "voted_for": 3, "commit_index": 1}).to_string(),
+        )
+        .unwrap();
+
+        let mut listeners = Vec::new();
+        let mut peers = Vec::new();
+        for id in 1..=3 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            peers.push(Peer {
+                id,
+                addr: listener.local_addr().unwrap().to_string(),
+            });
+            listeners.push(listener);
+        }
+        listeners.pop(); // node 3 stays down
+        let nodes: Vec<Running> = listeners
+            .into_iter()
+            .zip(&peers)
+            .map(|(listener, peer)| {
+                launch(
+                    listener,
+                    Config {
+                        id: peer.id,
+                        listen: peer.addr.clone(),
+                        peers: peers.clone(),
+                        data_dir: Some(dir.clone()),
+                        join: None,
+                    },
+                )
+            })
+            .collect();
+
+        let leader = wait_leader(&nodes).await;
+        assert_eq!(
+            nodes[leader].node.id(),
+            1,
+            "only node 1 has the committed entries"
+        );
+        let addr = nodes[leader].addr.clone();
+        let start = Instant::now();
+        let mut served = 0;
+        while start.elapsed() < Duration::from_secs(10) {
+            let (status, body) = get(&addr, "k").await;
+            assert_ne!(body, json!("old"), "stale read: status {status}");
+            if status == 200 {
+                assert_eq!(body, json!("new"));
+                served += 1;
+                if served >= 20 {
+                    break;
+                }
+            }
+        }
+        assert!(
+            served >= 20,
+            "reads never resumed after the no-op committed"
+        );
+
+        for node in nodes {
+            node.stop().await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn node_added_at_runtime_becomes_voter() {
         let mut nodes = cluster(3, None).await;

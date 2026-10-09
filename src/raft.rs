@@ -501,7 +501,10 @@ impl Node {
         }
     }
 
-    /// Confirm this node is still the leader with a majority, then read.
+    /// Confirm this node is still the leader with a majority, then read. A
+    /// new leader must first commit an entry of its own term (its no-op):
+    /// until then it may not know how far the old leader committed, and its
+    /// applied state can trail writes that were already acknowledged.
     pub(crate) async fn read(self: &Arc<Self>, key: String) -> Result<Option<Value>, RaftError> {
         let term = {
             let inner = self.inner.lock().await;
@@ -522,6 +525,15 @@ impl Node {
         if !quorum_ok {
             self.telemetry.read_quorum_failures.inc();
             tracing::warn!(node = inner.id, term, "linearizable read failed; no quorum");
+            return Err(RaftError::Unavailable);
+        }
+        if inner.log[inner.commit_index].term != term {
+            tracing::debug!(
+                node = inner.id,
+                term,
+                commit = inner.commit_index,
+                "read refused; nothing committed in this term yet"
+            );
             return Err(RaftError::Unavailable);
         }
         Ok(inner.data.get(&key).cloned())
