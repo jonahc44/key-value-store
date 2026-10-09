@@ -503,12 +503,21 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(voters(&nodes[leader].node).await, expected);
 
-        // The removed node keeps running and campaigning, but must not
-        // depose the leader.
+        // The removed node keeps running. It is sent the configuration that
+        // removed it, so it stops campaigning and cannot depose the leader.
+        let removed = &nodes[first].node;
+        let start = Instant::now();
+        while voters(removed).await.contains(&first_id) {
+            assert!(start.elapsed() < Duration::from_secs(3), "node {first_id} never learned it was removed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!events_of(removed, "removed_from_cluster").await.is_empty());
+        let elections = removed.telemetry().elections_started.get();
         let before = term(&leader_addr).await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(nodes[leader].node.is_leader().await);
         assert_eq!(term(&leader_addr).await, before);
+        assert_eq!(removed.telemetry().elections_started.get(), elections);
         assert_eq!(put(&leader_addr, "b", json!({"v": 2})).await.0, 201);
 
         // Removing again is a no-op.

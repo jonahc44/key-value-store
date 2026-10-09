@@ -28,6 +28,9 @@ const HEARTBEAT: Duration = Duration::from_millis(40);
 const TICK: Duration = Duration::from_millis(20);
 const PROPOSE_TIMEOUT: Duration = Duration::from_millis(1500);
 const CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a leader keeps sending to a removed member so it learns of its
+/// removal; an unreachable one is given up on after this.
+const DEPART_TIMEOUT: Duration = Duration::from_secs(5);
 const STATS_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +134,10 @@ struct Inner {
     /// Set while a leader that removed itself hands leadership to a voter;
     /// new proposals are refused so none are lost at the step-down.
     transferring: bool,
+    /// Members removed by a configuration this leader holds, still replicated
+    /// to until they have that configuration. Otherwise a removed server never
+    /// learns it left, and campaigns forever.
+    departing: HashMap<u64, Departing>,
     last_heartbeat_sent: Instant,
     last_quorum_ok: Instant,
     data_dir: Option<PathBuf>,
@@ -1028,21 +1035,24 @@ impl Node {
             return false;
         }
         let (voters, learners, quorum, term, self_vote) = {
-            let inner = self.inner.lock().await;
+            let mut inner = self.inner.lock().await;
             if inner.role != Role::Leader {
                 return false;
             }
+            let mut learners = inner.other_learners();
+            learners.extend(inner.departing_peers());
             (
                 inner.other_voters(),
-                inner.other_learners(),
+                learners,
                 inner.quorum(),
                 inner.current_term,
                 usize::from(inner.is_voter()),
             )
         };
 
-        // Learners never count toward quorum, so their replication must not be
-        // cancelled when the voter majority answers first.
+        // Learners and departing members never count toward quorum, so their
+        // replication must not be cancelled when the voter majority answers
+        // first.
         for peer in learners {
             let this = Arc::clone(self);
             tokio::spawn(async move { this.replicate_one(peer, false).await });
@@ -1151,7 +1161,7 @@ impl Node {
             }
             // The peer may have been removed while this RPC was in flight;
             // recording its progress would bring its replication state back.
-            if inner.membership.find(peer.id).is_none() {
+            if inner.membership.find(peer.id).is_none() && !inner.departing.contains_key(&peer.id) {
                 return RpcOutcome::Unreachable;
             }
             if success {
@@ -1168,6 +1178,15 @@ impl Node {
                 }
                 inner.next_index.insert(peer.id, matched + 1);
                 inner.advance_commit();
+                if inner
+                    .departing
+                    .get(&peer.id)
+                    .is_some_and(|departing| matched >= departing.index)
+                {
+                    tracing::info!(node = inner.id, peer = peer.id, "removed member has its removal");
+                    inner.forget_departed(peer.id);
+                    return RpcOutcome::CaughtUp;
+                }
                 if matched >= last.max(inner.last_index())
                     || inner.next_index[&peer.id] > inner.last_index()
                 {
@@ -1193,6 +1212,13 @@ impl Node {
         }
         RpcOutcome::Unreachable
     }
+}
+
+struct Departing {
+    peer: Peer,
+    /// Index of the configuration that removed the peer.
+    index: usize,
+    until: Instant,
 }
 
 struct Campaign {
@@ -1237,6 +1263,7 @@ impl Inner {
             last_leader_contact: now,
             election_in_progress: false,
             transferring: false,
+            departing: HashMap::new(),
             last_heartbeat_sent: now,
             last_quorum_ok: now,
             data_dir,
@@ -1344,14 +1371,40 @@ impl Inner {
                     "learners": Membership::ids(&membership.learners),
                 }),
             );
-            for peer in self.membership.voters.iter().chain(&self.membership.learners) {
-                if membership.find(peer.id).is_none() {
+            let removed: Vec<Peer> = self
+                .membership
+                .voters
+                .iter()
+                .chain(&self.membership.learners)
+                .filter(|peer| peer.id != self.id && membership.find(peer.id).is_none())
+                .cloned()
+                .collect();
+            for peer in removed {
+                if self.role == Role::Leader {
+                    let until = Instant::now() + DEPART_TIMEOUT;
+                    self.departing.insert(peer.id, Departing { peer, index, until });
+                } else {
                     self.telemetry.forget_peer(peer.id);
                 }
+            }
+            if self.membership.find(self.id).is_some()
+                && membership.find(self.id).is_none()
+                && self.role != Role::Leader
+            {
+                tracing::warn!(
+                    node = self.id,
+                    index,
+                    "removed from the cluster; this process can be stopped"
+                );
+                self.telemetry
+                    .event("removed_from_cluster", json!({ "index": index }));
             }
         }
         self.membership = membership;
         self.config_index = index;
+        // A member re-added, or a removal truncated away, is not departing.
+        let current = &self.membership;
+        self.departing.retain(|id, _| current.find(*id).is_none());
         if self.role == Role::Leader {
             let next = self.last_index() + 1;
             let targets: Vec<u64> = self
@@ -1359,6 +1412,7 @@ impl Inner {
                 .into_iter()
                 .chain(self.other_learners())
                 .map(|peer| peer.id)
+                .chain(self.departing.keys().copied())
                 .collect();
             for id in &targets {
                 self.next_index.entry(*id).or_insert(next);
@@ -1395,6 +1449,33 @@ impl Inner {
             .collect()
     }
 
+    /// Departing members still to be told, dropping those that ran out of
+    /// time.
+    fn departing_peers(&mut self) -> Vec<Peer> {
+        let now = Instant::now();
+        let expired: Vec<u64> = self
+            .departing
+            .iter()
+            .filter(|(_, departing)| now >= departing.until)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            tracing::warn!(node = self.id, peer = id, "removed member never acknowledged its removal");
+            self.forget_departed(id);
+        }
+        self.departing
+            .values()
+            .map(|departing| departing.peer.clone())
+            .collect()
+    }
+
+    fn forget_departed(&mut self, id: u64) {
+        self.departing.remove(&id);
+        self.next_index.remove(&id);
+        self.match_index.remove(&id);
+        self.telemetry.forget_peer(id);
+    }
+
     fn leader_addr(&self) -> Option<String> {
         let id = self.leader_id?;
         self.membership.find(id).map(|peer| peer.addr.clone())
@@ -1407,6 +1488,7 @@ impl Inner {
         let next = self.last_index() + 1;
         self.next_index.clear();
         self.match_index.clear();
+        self.departing.clear();
         for peer in self.other_voters().into_iter().chain(self.other_learners()) {
             self.next_index.insert(peer.id, next);
             self.match_index.insert(peer.id, 0);
