@@ -71,6 +71,9 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
     let mut cluster = Cluster::launch(&settings, &dir);
     let addrs: Arc<Vec<String>> = Arc::new(cluster.members.iter().map(|m| m.addr.clone()).collect());
     cluster.learn_ids(HEAL_TIMEOUT).await;
+    // A member answers /cluster/id while still discovering its peers, before
+    // it serves the client API; start only once every member does.
+    cluster.wait_serving(HEAL_TIMEOUT).await;
     let ids: Vec<String> = cluster.members.iter().map(|m| format!("{}={}", m.n, m.id)).collect();
     eprintln!("chaos: node ids {}", ids.join(" "));
     if cluster.wait_writable(&addrs, HEAL_TIMEOUT).await.is_none() {
@@ -138,10 +141,16 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
         summary["clients"] = json!(settings.clients);
         summary["nodes"] = json!(settings.nodes);
         summary["agreed_entries"] = json!(agreed);
+        // Raft state is ID.json plus, in newer versions, the ID.log.jsonl log.
         summary["state_bytes_max"] = json!(ids
             .iter()
-            .filter_map(|id| std::fs::metadata(dir.join(format!("{id}.json"))).ok())
-            .map(|meta| meta.len())
+            .map(|id| {
+                [format!("{id}.json"), format!("{id}.log.jsonl")]
+                    .iter()
+                    .filter_map(|name| std::fs::metadata(dir.join(name)).ok())
+                    .map(|meta| meta.len())
+                    .sum::<u64>()
+            })
             .max());
         summary["violations"] = json!(violations.len());
         summary["violation_samples"] = json!(violations.iter().take(5).collect::<Vec<_>>());
@@ -445,6 +454,19 @@ impl Cluster {
                 let text = format!("node {} exited on its own ({status}); see node{}.log", member.n, member.n);
                 self.note(text.clone());
                 self.unexpected_exits.push(text);
+            }
+        }
+    }
+
+    async fn wait_serving(&self, limit: Duration) {
+        let started = Instant::now();
+        for member in &self.members {
+            while !matches!(
+                http(&member.addr, "GET", "/cluster/members", None, PROBE_TIMEOUT).await,
+                Reply::Status(200, _)
+            ) {
+                assert!(started.elapsed() < limit, "node {} never served the client API", member.n);
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
     }
