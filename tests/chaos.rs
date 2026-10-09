@@ -20,8 +20,9 @@
 //! (8), CHAOS_MAX_DOWN (members out at once; the default keeps a majority up,
 //! larger values allow full outages) and CHAOS_SEED. The seed fixes the fault
 //! and client decisions, not thread timing, so a rerun is similar, not
-//! identical. The data directory (raft state, event journals, per-member
-//! logs, fault timeline) is kept when the run fails, or always with
+//! identical. The data directory (raft state keyed by the random node ids
+//! printed at start, event journals, nodeN.log per member, fault timeline)
+//! is kept when the run fails, or always with
 //! CHAOS_KEEP=1.
 #![cfg(unix)]
 
@@ -67,6 +68,9 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
 
     let mut cluster = Cluster::launch(&settings, &dir);
     let addrs: Arc<Vec<String>> = Arc::new(cluster.members.iter().map(|m| m.addr.clone()).collect());
+    cluster.learn_ids(HEAL_TIMEOUT).await;
+    let ids: Vec<String> = cluster.members.iter().map(|m| format!("{}={}", m.n, m.id)).collect();
+    eprintln!("chaos: node ids {}", ids.join(" "));
     if cluster.wait_writable(&addrs, HEAL_TIMEOUT).await.is_none() {
         cluster.stop_all().await;
         panic!("cluster never became writable; see {}", dir.display());
@@ -94,6 +98,7 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
     violations.extend(cluster.unexpected_exits.iter().cloned());
 
     cluster.heal().await;
+    violations.extend(cluster.learn_ids(HEAL_TIMEOUT).await);
     let recovery = cluster.wait_writable(&addrs, HEAL_TIMEOUT).await;
     match recovery {
         Some(_) => {
@@ -271,6 +276,10 @@ enum State {
 }
 
 struct Member {
+    /// Stable 1-based label for the timeline and log file names.
+    n: usize,
+    /// Raft id, picked at random by the member on first start and learned
+    /// from `GET /cluster/id`; 0 until then.
     id: u64,
     addr: String,
     child: Option<Child>,
@@ -288,7 +297,6 @@ struct Faults {
 
 struct Cluster {
     dir: PathBuf,
-    peers: Vec<String>,
     members: Vec<Member>,
     started: Instant,
     timeline: Vec<String>,
@@ -304,8 +312,9 @@ impl Cluster {
         let members: Vec<Member> = listeners
             .iter()
             .zip(1..)
-            .map(|(listener, id)| Member {
-                id,
+            .map(|(listener, n)| Member {
+                n,
+                id: 0,
                 addr: listener.local_addr().unwrap().to_string(),
                 child: None,
                 state: State::Down,
@@ -315,7 +324,6 @@ impl Cluster {
         drop(listeners);
         let mut cluster = Self {
             dir: dir.to_path_buf(),
-            peers: members.iter().map(|m| format!("{}={}", m.id, m.addr)).collect(),
             members,
             started: Instant::now(),
             timeline: Vec::new(),
@@ -337,18 +345,16 @@ impl Cluster {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.dir.join(format!("{}.log", member.id)))
+            .open(self.dir.join(format!("node{}.log", member.n)))
             .unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_key-value-store"));
         command
-            .arg("--id")
-            .arg(member.id.to_string())
             .arg("--listen")
             .arg(&member.addr)
             .arg("--data-dir")
             .arg(&self.dir);
-        for peer in &self.peers {
-            command.arg("--peer").arg(peer);
+        for peer in self.members.iter().filter(|m| m.n != member.n) {
+            command.arg("--peer").arg(&peer.addr);
         }
         // The tracing subscriber writes to stdout, so capture both streams.
         let child = command
@@ -359,11 +365,11 @@ impl Cluster {
             .kill_on_drop(true)
             .spawn()
             .expect("failed to start member");
-        let id = member.id;
+        let n = member.n;
         let member = &mut self.members[index];
         member.child = Some(child);
         member.state = State::Up;
-        self.note(format!("start  node {id}"));
+        self.note(format!("start  node {n}"));
     }
 
     async fn crash(&mut self, index: usize, outage: Duration) {
@@ -374,8 +380,8 @@ impl Cluster {
         }
         member.state = State::Down;
         member.back_at = Instant::now() + outage;
-        let id = member.id;
-        self.note(format!("kill   node {id} for {}ms", outage.as_millis()));
+        let n = member.n;
+        self.note(format!("kill   node {n} for {}ms", outage.as_millis()));
     }
 
     fn freeze(&mut self, index: usize, outage: Duration) {
@@ -383,8 +389,8 @@ impl Cluster {
         signal(member.child.as_ref(), "STOP");
         member.state = State::Frozen;
         member.back_at = Instant::now() + outage;
-        let id = member.id;
-        self.note(format!("freeze node {id} for {}ms", outage.as_millis()));
+        let n = member.n;
+        self.note(format!("freeze node {n} for {}ms", outage.as_millis()));
     }
 
     fn revive(&mut self, index: usize) {
@@ -394,8 +400,8 @@ impl Cluster {
                 let member = &mut self.members[index];
                 signal(member.child.as_ref(), "CONT");
                 member.state = State::Up;
-                let id = member.id;
-                self.note(format!("thaw   node {id}"));
+                let n = member.n;
+                self.note(format!("thaw   node {n}"));
             }
             State::Down => self.spawn(index),
         }
@@ -412,11 +418,35 @@ impl Cluster {
                 member.child = None;
                 member.state = State::Down;
                 member.back_at = Instant::now() + Duration::from_millis(500);
-                let text = format!("node {} exited on its own ({status}); see {}.log", member.id, member.id);
+                let text = format!("node {} exited on its own ({status}); see node{}.log", member.n, member.n);
                 self.note(text.clone());
                 self.unexpected_exits.push(text);
             }
         }
+    }
+
+    /// Ask every member for its id. Returns those that differ from the id
+    /// already known, which after the first call means an id was not kept
+    /// across a restart.
+    async fn learn_ids(&mut self, limit: Duration) -> Vec<String> {
+        let started = Instant::now();
+        let mut changed = Vec::new();
+        for member in &mut self.members {
+            let id = loop {
+                if let Reply::Status(200, body) = http(&member.addr, "GET", "/cluster/id", None, PROBE_TIMEOUT).await {
+                    if let Some(id) = json_of(&body)["id"].as_u64() {
+                        break id;
+                    }
+                }
+                assert!(started.elapsed() < limit, "node {} never reported its id", member.n);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            if member.id != 0 && member.id != id {
+                changed.push(format!("node {} came back as id {id}, was {}", member.n, member.id));
+            }
+            member.id = id;
+        }
+        changed
     }
 
     /// The leader according to the first live member that answers.
@@ -511,7 +541,7 @@ impl Cluster {
                     }
                     _ => (None, None),
                 };
-                views.push((member.id, view));
+                views.push((member.n, view));
             }
             let first = views[0].1;
             if first.0.is_some() && views.iter().all(|(_, view)| *view == first) {
