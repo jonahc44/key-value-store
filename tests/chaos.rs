@@ -24,7 +24,8 @@
 //! printed at start, event journals, nodeN.log per member, fault timeline)
 //! is kept when the run fails, or always with
 //! CHAOS_KEEP=1. With CHAOS_SUMMARY=PATH a JSON summary line, tagged with
-//! CHAOS_LABEL, is appended to PATH for comparing runs.
+//! CHAOS_LABEL, is appended to PATH for comparing runs; it includes
+//! per-window series (CHAOS_WINDOW seconds, default 10) for long runs.
 #![cfg(unix)]
 
 use serde_json::{Value, json};
@@ -79,15 +80,16 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
 
     let mut rng = Rng::new(settings.seed);
     let stop = Arc::new(AtomicBool::new(false));
+    let origin = Instant::now();
     let clients: Vec<_> = (1..=settings.clients)
         .map(|id| {
             let addrs = Arc::clone(&addrs);
             let stop = Arc::clone(&stop);
-            tokio::spawn(client(id, addrs, rng.next(), stop))
+            tokio::spawn(client(id, addrs, rng.next(), stop, origin))
         })
         .collect();
 
-    let faults = cluster.rampage(&settings, &mut rng).await;
+    let faults = cluster.rampage(&settings, &mut rng, origin).await;
     stop.store(true, Ordering::Relaxed);
     let mut logs = Vec::new();
     for handle in clients {
@@ -134,7 +136,15 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
         summary["seed"] = json!(settings.seed);
         summary["max_down"] = json!(settings.max_down);
         summary["clients"] = json!(settings.clients);
+        summary["nodes"] = json!(settings.nodes);
+        summary["agreed_entries"] = json!(agreed);
+        summary["state_bytes_max"] = json!(ids
+            .iter()
+            .filter_map(|id| std::fs::metadata(dir.join(format!("{id}.json"))).ok())
+            .map(|meta| meta.len())
+            .max());
         summary["violations"] = json!(violations.len());
+        summary["violation_samples"] = json!(violations.iter().take(5).collect::<Vec<_>>());
         let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
         std::io::Write::write_all(&mut file, format!("{summary}\n").as_bytes()).unwrap();
     }
@@ -305,6 +315,8 @@ struct Faults {
     kills: u64,
     freezes: u64,
     aimed_at_leader: u64,
+    /// When each fault was injected, from the start of the chaos phase.
+    at: Vec<Duration>,
 }
 
 struct Cluster {
@@ -473,7 +485,7 @@ impl Cluster {
     }
 
     /// Inject faults until the configured duration is up.
-    async fn rampage(&mut self, settings: &Settings, rng: &mut Rng) -> Faults {
+    async fn rampage(&mut self, settings: &Settings, rng: &mut Rng, origin: Instant) -> Faults {
         let mut faults = Faults::default();
         let deadline = Instant::now() + Duration::from_secs(settings.secs);
         let mut next_fault = Instant::now() + rng.millis(100, 1200);
@@ -504,6 +516,7 @@ impl Cluster {
                 } else {
                     rng.millis(150, 3000)
                 };
+                faults.at.push(origin.elapsed());
                 if rng.chance(FREEZE_SHARE) {
                     faults.freezes += 1;
                     self.freeze(target, outage);
@@ -606,8 +619,11 @@ struct ClientLog {
     register: Option<u64>,
     /// Register writes with unknown outcome; any of them may apply later.
     maybe: HashSet<u64>,
-    /// Round-trip time of every acknowledged write.
-    write_latency: Vec<Duration>,
+    /// Per acknowledged write: when it was sent (from the start of the
+    /// chaos phase) and its round-trip time.
+    acked_at: Vec<(Duration, Duration)>,
+    /// When each write that got a 503 or no answer was sent.
+    failed_at: Vec<Duration>,
     violations: Vec<String>,
 }
 
@@ -625,7 +641,7 @@ impl ClientLog {
 /// Each client owns keys `u{id}-{seq}` (written once) and a register
 /// `r{id}` (overwritten with rising seq), so every check is per client and
 /// needs no coordination between clients.
-async fn client(id: u64, addrs: Arc<Vec<String>>, seed: u64, stop: Arc<AtomicBool>) -> ClientLog {
+async fn client(id: u64, addrs: Arc<Vec<String>>, seed: u64, stop: Arc<AtomicBool>, origin: Instant) -> ClientLog {
     let mut rng = Rng::new(seed);
     let mut log = ClientLog {
         id,
@@ -633,7 +649,8 @@ async fn client(id: u64, addrs: Arc<Vec<String>>, seed: u64, stop: Arc<AtomicBoo
         acked: Vec::new(),
         register: None,
         maybe: HashSet::new(),
-        write_latency: Vec::new(),
+        acked_at: Vec::new(),
+        failed_at: Vec::new(),
         violations: Vec::new(),
     };
     let register_path = format!("/r{id}");
@@ -671,8 +688,10 @@ async fn client(id: u64, addrs: Arc<Vec<String>>, seed: u64, stop: Arc<AtomicBoo
             let sent = Instant::now();
             let reply = http(addr, "PUT", &path, Some(&value), CLIENT_TIMEOUT).await;
             log.count("PUT", &reply);
-            if let Reply::Status(201, _) = reply {
-                log.write_latency.push(sent.elapsed());
+            match reply {
+                Reply::Status(201, _) => log.acked_at.push((sent - origin, sent.elapsed())),
+                Reply::Refused => {}
+                _ => log.failed_at.push(sent - origin),
             }
             match reply {
                 Reply::Status(201, _) if register => log.register = Some(seq),
@@ -862,14 +881,14 @@ fn report(
         terms.len(),
         terms.keys().last().copied().unwrap_or(0)
     );
-    let mut latency: Vec<Duration> = logs.iter().flat_map(|log| log.write_latency.iter().copied()).collect();
+    let mut latency: Vec<Duration> = logs.iter().flat_map(|log| log.acked_at.iter().map(|(_, rtt)| *rtt)).collect();
     latency.sort_unstable();
-    let percentile = |p: f64| {
-        latency
-            .get(((latency.len() as f64 * p) as usize).min(latency.len().saturating_sub(1)))
-            .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
-    };
-    let (p50, p90, p99, max) = (percentile(0.5), percentile(0.9), percentile(0.99), percentile(1.0));
+    let (p50, p90, p99, max) = (
+        percentile_ms(&latency, 0.5),
+        percentile_ms(&latency, 0.9),
+        percentile_ms(&latency, 0.99),
+        percentile_ms(&latency, 1.0),
+    );
     eprintln!("chaos: acknowledged write latency ms: p50 {p50:.1}, p90 {p90:.1}, p99 {p99:.1}, max {max:.1}");
     for (event, count) in journals {
         eprintln!("chaos:   {event:<24} {count}");
@@ -894,5 +913,46 @@ fn report(
         "terms": terms.len(),
         "journal": journals,
         "recovery_s": recovery.map(|time| time.as_secs_f64()),
+        "windows": windows(logs, faults, elapsed),
     })
+}
+
+/// Latency at quantile `q` of sorted samples, in milliseconds.
+fn percentile_ms(sorted: &[Duration], q: f64) -> f64 {
+    let index = ((sorted.len() as f64 * q) as usize).min(sorted.len().saturating_sub(1));
+    sorted.get(index).map_or(0.0, |d| d.as_secs_f64() * 1000.0)
+}
+
+/// Writes, failures, faults and latency per CHAOS_WINDOW seconds (default
+/// 10), to show how a long run changes over time.
+fn windows(logs: &[ClientLog], faults: &Faults, elapsed: Duration) -> Value {
+    let width = Duration::from_secs(env_or("CHAOS_WINDOW", 10u64).max(1));
+    let count = (elapsed.as_secs_f64() / width.as_secs_f64()).ceil() as usize;
+    let slot = |at: Duration| ((at.as_secs_f64() / width.as_secs_f64()) as usize).min(count.saturating_sub(1));
+    let mut latency = vec![Vec::new(); count];
+    let mut failed = vec![0u64; count];
+    let mut injected = vec![0u64; count];
+    for log in logs {
+        for (at, rtt) in &log.acked_at {
+            latency[slot(*at)].push(*rtt);
+        }
+        for at in &log.failed_at {
+            failed[slot(*at)] += 1;
+        }
+    }
+    for at in &faults.at {
+        injected[slot(*at)] += 1;
+    }
+    let rows = (0..count).map(|i| {
+        latency[i].sort_unstable();
+        json!({
+            "start_s": i as u64 * width.as_secs(),
+            "acked": latency[i].len(),
+            "failed": failed[i],
+            "faults": injected[i],
+            "p50_ms": percentile_ms(&latency[i], 0.5),
+            "p99_ms": percentile_ms(&latency[i], 0.99),
+        })
+    });
+    Value::Array(rows.collect())
 }
