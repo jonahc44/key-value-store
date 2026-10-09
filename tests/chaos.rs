@@ -23,7 +23,8 @@
 //! identical. The data directory (raft state keyed by the random node ids
 //! printed at start, event journals, nodeN.log per member, fault timeline)
 //! is kept when the run fails, or always with
-//! CHAOS_KEEP=1.
+//! CHAOS_KEEP=1. With CHAOS_SUMMARY=PATH a JSON summary line, tagged with
+//! CHAOS_LABEL, is appended to PATH for comparing runs.
 #![cfg(unix)]
 
 use serde_json::{Value, json};
@@ -125,7 +126,18 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
         }
     }
 
-    report(&logs, &faults, chaos_elapsed, recovery, agreed, &terms);
+    let journals = journal_counts(&dir, &ids);
+    let summary = report(&logs, &faults, chaos_elapsed, recovery, agreed, &terms, &journals);
+    if let Ok(path) = std::env::var("CHAOS_SUMMARY") {
+        let mut summary = summary;
+        summary["label"] = json!(std::env::var("CHAOS_LABEL").unwrap_or_default());
+        summary["seed"] = json!(settings.seed);
+        summary["max_down"] = json!(settings.max_down);
+        summary["clients"] = json!(settings.clients);
+        summary["violations"] = json!(violations.len());
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        std::io::Write::write_all(&mut file, format!("{summary}\n").as_bytes()).unwrap();
+    }
     if !violations.is_empty() {
         for violation in &violations {
             eprintln!("VIOLATION: {violation}");
@@ -594,6 +606,8 @@ struct ClientLog {
     register: Option<u64>,
     /// Register writes with unknown outcome; any of them may apply later.
     maybe: HashSet<u64>,
+    /// Round-trip time of every acknowledged write.
+    write_latency: Vec<Duration>,
     violations: Vec<String>,
 }
 
@@ -619,6 +633,7 @@ async fn client(id: u64, addrs: Arc<Vec<String>>, seed: u64, stop: Arc<AtomicBoo
         acked: Vec::new(),
         register: None,
         maybe: HashSet::new(),
+        write_latency: Vec::new(),
         violations: Vec::new(),
     };
     let register_path = format!("/r{id}");
@@ -653,8 +668,12 @@ async fn client(id: u64, addrs: Arc<Vec<String>>, seed: u64, stop: Arc<AtomicBoo
             let register = roll < 30;
             let path = if register { register_path.clone() } else { format!("/u{id}-{seq}") };
             let value = json!({ "client": id, "seq": seq });
+            let sent = Instant::now();
             let reply = http(addr, "PUT", &path, Some(&value), CLIENT_TIMEOUT).await;
             log.count("PUT", &reply);
+            if let Reply::Status(201, _) = reply {
+                log.write_latency.push(sent.elapsed());
+            }
             match reply {
                 Reply::Status(201, _) if register => log.register = Some(seq),
                 Reply::Status(201, _) => log.acked.push(seq),
@@ -772,6 +791,24 @@ fn check_logs(dir: &Path, ids: &[u64]) -> (usize, Vec<String>) {
     (commit, violations)
 }
 
+/// Counts of selected journal events across members, keyed like
+/// "stepped_down:removed" or "election_started".
+fn journal_counts(dir: &Path, ids: &[u64]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for id in ids {
+        let journal = std::fs::read_to_string(dir.join(format!("{id}.events.jsonl"))).unwrap_or_default();
+        for event in journal.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+            let key = match event["event"].as_str() {
+                Some("stepped_down") => format!("stepped_down:{}", event["reason"].as_str().unwrap_or("?")),
+                Some(kind @ ("election_started" | "log_truncated")) => kind.to_string(),
+                _ => continue,
+            };
+            *counts.entry(key).or_default() += 1;
+        }
+    }
+    counts
+}
+
 /// Leaders each member saw per term, from the event journals. A member killed
 /// mid-write can leave a torn last line, which is skipped.
 fn leaders_by_term(dir: &Path, ids: &[u64]) -> BTreeMap<u64, BTreeSet<u64>> {
@@ -796,7 +833,8 @@ fn report(
     recovery: Option<Duration>,
     agreed: usize,
     terms: &BTreeMap<u64, BTreeSet<u64>>,
-) {
+    journals: &BTreeMap<String, u64>,
+) -> Value {
     let mut outcomes: BTreeMap<&str, u64> = BTreeMap::new();
     for log in logs {
         for (outcome, count) in &log.outcomes {
@@ -824,8 +862,37 @@ fn report(
         terms.len(),
         terms.keys().last().copied().unwrap_or(0)
     );
+    let mut latency: Vec<Duration> = logs.iter().flat_map(|log| log.write_latency.iter().copied()).collect();
+    latency.sort_unstable();
+    let percentile = |p: f64| {
+        latency
+            .get(((latency.len() as f64 * p) as usize).min(latency.len().saturating_sub(1)))
+            .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
+    };
+    let (p50, p90, p99, max) = (percentile(0.5), percentile(0.9), percentile(0.99), percentile(1.0));
+    eprintln!("chaos: acknowledged write latency ms: p50 {p50:.1}, p90 {p90:.1}, p99 {p99:.1}, max {max:.1}");
+    for (event, count) in journals {
+        eprintln!("chaos:   {event:<24} {count}");
+    }
     match recovery {
         Some(time) => eprintln!("chaos: writable {:.2}s after healing", time.as_secs_f64()),
         None => eprintln!("chaos: never writable after healing"),
     }
+    json!({
+        "secs": secs,
+        "kills": faults.kills,
+        "freezes": faults.freezes,
+        "writes": writes,
+        "acked": acked,
+        "acked_per_s": acked as f64 / secs,
+        "unavailable": outcomes.get("PUT 503").copied().unwrap_or(0),
+        "lost": outcomes.get("PUT lost").copied().unwrap_or(0),
+        "p50_ms": p50,
+        "p90_ms": p90,
+        "p99_ms": p99,
+        "max_ms": max,
+        "terms": terms.len(),
+        "journal": journals,
+        "recovery_s": recovery.map(|time| time.as_secs_f64()),
+    })
 }
