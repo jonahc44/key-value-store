@@ -97,7 +97,9 @@ struct Entry {
 }
 
 pub(crate) enum RaftError {
-    NotLeader { leader: Option<String> },
+    NotLeader {
+        leader: Option<String>,
+    },
     Unavailable,
     /// Temporarily refused; the caller should retry.
     Busy(String),
@@ -794,13 +796,22 @@ impl Node {
             inner.step_down("removed");
         }
         let Some(peer) = target.filter(|_| caught_up) else {
-            tracing::warn!(node = self.id, term, "stepped down without a transfer target");
+            tracing::warn!(
+                node = self.id,
+                term,
+                "stepped down without a transfer target"
+            );
             return;
         };
         let request = json!({ "term": term, "leader_id": self.id });
         match self.peer_rpc(&peer, "/raft/timeout-now", &request).await {
             Ok(_) => {
-                tracing::info!(node = self.id, target = peer.id, term, "transferred leadership");
+                tracing::info!(
+                    node = self.id,
+                    target = peer.id,
+                    term,
+                    "transferred leadership"
+                );
                 self.telemetry.event(
                     "leadership_transferred",
                     json!({ "term": term, "target": peer.id }),
@@ -913,7 +924,8 @@ impl Node {
                     "prevote": true,
                 });
                 let this = Arc::clone(self);
-                pending.spawn(async move { this.peer_rpc(&peer, "/raft/request-vote", &req).await });
+                pending
+                    .spawn(async move { this.peer_rpc(&peer, "/raft/request-vote", &req).await });
             }
             let mut answered = 0usize;
             while let Some(joined) = pending.join_next().await {
@@ -958,7 +970,6 @@ impl Node {
                 term = campaign.current_term + 1,
                 "prevote succeeded"
             );
-
         }
 
         let vote_req = {
@@ -1050,9 +1061,8 @@ impl Node {
             )
         };
 
-        // Learners and departing members never count toward quorum, so their
-        // replication must not be cancelled when the voter majority answers
-        // first.
+        // Learners and departing members never count toward quorum, so they
+        // are never waited on.
         for peer in learners {
             let this = Arc::clone(self);
             tokio::spawn(async move { this.replicate_one(peer, false).await });
@@ -1061,7 +1071,7 @@ impl Node {
         let mut pending = JoinSet::new();
         for peer in voters {
             let this = Arc::clone(self);
-            pending.spawn(async move { this.replicate_one(peer, true).await });
+            pending.spawn(async move { this.replicate_one(peer, false).await });
         }
         let mut ok = self_vote;
         while ok < quorum {
@@ -1072,7 +1082,12 @@ impl Node {
                 ok += 1;
             }
         }
-        drop(pending);
+        // Let the slower voters finish rather than cancelling them: up-to-date
+        // followers answer within a millisecond, so a follower that is catching
+        // up would otherwise be cancelled mid-RPC every round and never
+        // advance. Voter rounds skip a peer that already has one in flight, so
+        // at most one round per peer outlives this call.
+        pending.detach_all();
         let mut inner = self.inner.lock().await;
         if inner.role == Role::Leader && inner.current_term == term && ok >= quorum {
             inner.last_quorum_ok = Instant::now();
@@ -1092,12 +1107,17 @@ impl Node {
     }
 
     fn peer_lock(&self, id: u64) -> Arc<Mutex<()>> {
-        let mut locks = self.peer_locks.lock().unwrap_or_else(|err| err.into_inner());
+        let mut locks = self
+            .peer_locks
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         Arc::clone(locks.entry(id).or_default())
     }
 
     /// `wait` queues behind an in-flight round to the same peer; otherwise a
-    /// busy peer is skipped so detached learner rounds cannot pile up.
+    /// busy peer is skipped so detached rounds cannot pile up behind a slow or
+    /// frozen peer. A skipped peer does not count toward quorum: its in-flight
+    /// round may have sent its last RPC before the caller's round began.
     async fn replicate_one(self: &Arc<Self>, peer: Peer, wait: bool) -> RpcOutcome {
         let mutex = self.peer_lock(peer.id);
         let _guard = if wait {
@@ -1183,7 +1203,11 @@ impl Node {
                     .get(&peer.id)
                     .is_some_and(|departing| matched >= departing.index)
                 {
-                    tracing::info!(node = inner.id, peer = peer.id, "removed member has its removal");
+                    tracing::info!(
+                        node = inner.id,
+                        peer = peer.id,
+                        "removed member has its removal"
+                    );
                     inner.forget_departed(peer.id);
                     return RpcOutcome::CaughtUp;
                 }
@@ -1382,7 +1406,8 @@ impl Inner {
             for peer in removed {
                 if self.role == Role::Leader {
                     let until = Instant::now() + DEPART_TIMEOUT;
-                    self.departing.insert(peer.id, Departing { peer, index, until });
+                    self.departing
+                        .insert(peer.id, Departing { peer, index, until });
                 } else {
                     self.telemetry.forget_peer(peer.id);
                 }
@@ -1460,7 +1485,11 @@ impl Inner {
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
-            tracing::warn!(node = self.id, peer = id, "removed member never acknowledged its removal");
+            tracing::warn!(
+                node = self.id,
+                peer = id,
+                "removed member never acknowledged its removal"
+            );
             self.forget_departed(id);
         }
         self.departing
@@ -1526,7 +1555,12 @@ impl Inner {
         self.transferring = false;
         self.election_timeout = random_timeout(self.id);
         self.election_deadline = Instant::now() + self.election_timeout;
-        tracing::warn!(node = self.id, term = self.current_term, reason, "stepped down");
+        tracing::warn!(
+            node = self.id,
+            term = self.current_term,
+            reason,
+            "stepped down"
+        );
         self.fail_uncommitted();
     }
 

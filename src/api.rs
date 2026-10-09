@@ -32,10 +32,16 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/raft/request-vote", post(request_vote))
         .route("/raft/append-entries", post(append_entries))
         .route("/raft/timeout-now", post(timeout_now))
+        .route("/cluster/id", get(node_id))
         .route("/cluster/metrics", get(metrics))
         .route("/cluster/events", get(events))
         .merge(client)
         .with_state(node)
+}
+
+/// Lets a starting member learn this member's id from its address.
+async fn node_id(State(node): State<Arc<Node>>) -> Json<Value> {
+    Json(json!({ "id": node.id() }))
 }
 
 /// Count and time client requests. Requests forwarded by another member are
