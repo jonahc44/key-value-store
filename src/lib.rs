@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use raft::{Config as ServerConfig, Peer};
+pub use raft::{Config as ServerConfig, DEFAULT_SNAPSHOT_EVERY, Peer};
 
 const JOIN_RETRY: Duration = Duration::from_millis(500);
 
@@ -26,6 +26,7 @@ pub struct Options {
     pub peers: Vec<String>,
     pub data_dir: Option<PathBuf>,
     pub join: Option<String>,
+    pub snapshot_every: usize,
 }
 
 /// Resolve this member's id (random on first start, saved under the data
@@ -46,6 +47,7 @@ pub async fn run(options: Options) -> std::io::Result<()> {
         peers: identity.peers,
         data_dir: options.data_dir,
         join: options.join,
+        snapshot_every: options.snapshot_every,
     };
     serve_on(tokio::net::TcpListener::from_std(listener)?, config).await
 }
@@ -127,7 +129,7 @@ mod tests {
     use super::Peer;
     use crate::api;
     use crate::net::call;
-    use crate::raft::{Config, Node};
+    use crate::raft::{Config, DEFAULT_SNAPSHOT_EVERY, Node};
     use serde_json::json;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -159,6 +161,14 @@ mod tests {
     }
 
     async fn cluster(size: u64, data_dir: Option<std::path::PathBuf>) -> Vec<Running> {
+        cluster_with(size, data_dir, DEFAULT_SNAPSHOT_EVERY).await
+    }
+
+    async fn cluster_with(
+        size: u64,
+        data_dir: Option<std::path::PathBuf>,
+        snapshot_every: usize,
+    ) -> Vec<Running> {
         let mut listeners = Vec::new();
         let mut peers = Vec::new();
         for id in 1..=size {
@@ -178,6 +188,7 @@ mod tests {
                     peers: peers.clone(),
                     data_dir: data_dir.clone(),
                     join: None,
+                    snapshot_every,
                 },
             ));
         }
@@ -196,6 +207,7 @@ mod tests {
                 peers: Vec::new(),
                 data_dir: None,
                 join: Some(seed.to_string()),
+                snapshot_every: DEFAULT_SNAPSHOT_EVERY,
             },
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -518,6 +530,7 @@ mod tests {
                         peers: peers.clone(),
                         data_dir: Some(dir.clone()),
                         join: None,
+                        snapshot_every: DEFAULT_SNAPSHOT_EVERY,
                     },
                 )
             })
@@ -655,13 +668,19 @@ mod tests {
     }
 
     async fn term(addr: &str) -> u64 {
+        metric(addr, "raft_term").await
+    }
+
+    /// An unlabelled metric from `addr`.
+    async fn metric(addr: &str, name: &str) -> u64 {
         let (_, body) = call(addr, "GET", "/cluster/metrics", None).await.unwrap();
+        let prefix = format!("{name} ");
         String::from_utf8(body)
             .unwrap()
             .lines()
-            .find_map(|line| line.strip_prefix("raft_term "))
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
             .and_then(|value| value.trim().parse().ok())
-            .expect("raft_term gauge missing")
+            .unwrap_or_else(|| panic!("{name} metric missing"))
     }
 
     #[tokio::test]
@@ -903,5 +922,82 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every 10 applied entries the log is cut to a snapshot plus a short
+    /// tail, in memory and on disk, and a restart rebuilds the same state.
+    #[tokio::test]
+    async fn log_is_compacted_and_survives_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "kv-compact-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nodes = cluster_with(1, Some(dir.clone()), 10).await;
+        let addr = nodes[0].addr.clone();
+        for i in 0..60 {
+            let key = format!("k{}", i % 7);
+            assert_eq!(put(&addr, &key, json!({"v": i})).await.0, 201);
+        }
+        assert_eq!(delete(&addr, "k3").await, 204);
+        assert!(metric(&addr, "raft_snapshot_index").await >= 50);
+        // At most 10 entries since the snapshot, plus a tail of 10 / 4.
+        assert!(metric(&addr, "raft_log_entries").await <= 12);
+        let lines = std::fs::read_to_string(dir.join("1.log.jsonl"))
+            .unwrap()
+            .lines()
+            .count();
+        assert!(lines <= 13, "log file has {lines} lines");
+        assert!(dir.join("1.snapshot.json").exists());
+        nodes.into_iter().next().unwrap().stop().await;
+
+        let nodes = cluster_with(1, Some(dir.clone()), 10).await;
+        let addr = nodes[0].addr.clone();
+        // Puts 53..=59 are the last to each key.
+        for i in 53..60 {
+            let key = format!("k{}", i % 7);
+            if key == "k3" {
+                assert_eq!(get(&addr, &key).await.0, 404);
+            } else {
+                assert_eq!(get(&addr, &key).await.1, json!({"v": i}), "{key}");
+            }
+        }
+        assert_eq!(put(&addr, "after", json!({"v": 1})).await.0, 201);
+        assert_eq!(get(&addr, "after").await.1, json!({"v": 1}));
+        nodes.into_iter().next().unwrap().stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A member that joins after the leader compacted its log is sent a
+    /// snapshot, then follows the log from there.
+    #[tokio::test]
+    async fn new_member_catches_up_from_snapshot() {
+        let nodes = cluster_with(3, None, 10).await;
+        let leader = wait_leader(&nodes).await;
+        let leader_addr = nodes[leader].addr.clone();
+        for i in 0..40 {
+            let key = format!("k{}", i % 5);
+            assert_eq!(put(&leader_addr, &key, json!({"v": i})).await.0, 201);
+        }
+        assert!(metric(&leader_addr, "raft_snapshot_index").await > 0);
+
+        let joiner = join(4, &leader_addr).await;
+        for i in 35..40 {
+            wait_local(&joiner.node, &format!("k{}", i % 5), &json!({"v": i})).await;
+        }
+        assert_eq!(voters(&nodes[leader].node).await, vec![1, 2, 3, 4]);
+        assert!(metric(&leader_addr, "raft_snapshots_sent_total").await >= 1);
+        assert!(metric(&joiner.addr, "raft_snapshots_installed_total").await >= 1);
+
+        assert_eq!(put(&leader_addr, "late", json!({"v": 1})).await.0, 201);
+        wait_local(&joiner.node, "late", &json!({"v": 1})).await;
+
+        joiner.stop().await;
+        for node in nodes {
+            node.stop().await;
+        }
     }
 }

@@ -6,7 +6,7 @@ use crate::net;
 use crate::raft::{Command, Node, Peer, RaftError};
 use crate::telemetry::ClientOp;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -32,6 +32,12 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/raft/request-vote", post(request_vote))
         .route("/raft/append-entries", post(append_entries))
         .route("/raft/timeout-now", post(timeout_now))
+        // A snapshot carries the whole key space, so it is exempt from the
+        // default 2 MB body limit.
+        .route(
+            "/raft/install-snapshot",
+            post(install_snapshot).layer(DefaultBodyLimit::disable()),
+        )
         .route("/cluster/id", get(node_id))
         .route("/cluster/metrics", get(metrics))
         .route("/cluster/events", get(events))
@@ -79,6 +85,10 @@ async fn request_vote(State(node): State<Arc<Node>>, Json(body): Json<Value>) ->
 
 async fn append_entries(State(node): State<Arc<Node>>, Json(body): Json<Value>) -> Json<Value> {
     Json(node.handle_append_entries(&body).await)
+}
+
+async fn install_snapshot(State(node): State<Arc<Node>>, Json(body): Json<Value>) -> Json<Value> {
+    Json(node.handle_install_snapshot(&body).await)
 }
 
 async fn timeout_now(State(node): State<Arc<Node>>, Json(body): Json<Value>) -> Json<Value> {

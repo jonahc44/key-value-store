@@ -12,6 +12,13 @@
 //! receives the log without voting, and is promoted once it has caught up.
 //! Any member but the last voter can be removed. A leader that removes itself
 //! leads until the change commits, then hands off to the most caught-up voter.
+//!
+//! The log is compacted with snapshots (Raft §7). Every `snapshot_every`
+//! applied entries a member saves its key space, and the membership in effect,
+//! as a snapshot and drops the log before it but for a trailing window, so
+//! memory, disk and restart time follow the key space rather than the write
+//! history. A follower that needs entries the leader has dropped, such as a
+//! new learner, is sent the leader's snapshot instead.
 
 use crate::net;
 use crate::telemetry::{Gauges, Telemetry};
@@ -32,6 +39,9 @@ const CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// removal; an unreachable one is given up on after this.
 const DEPART_TIMEOUT: Duration = Duration::from_secs(5);
 const STATS_INTERVAL: Duration = Duration::from_secs(60);
+/// A snapshot carries the whole key space, so it gets longer than an append.
+const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_SNAPSHOT_EVERY: usize = 8192;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
@@ -46,6 +56,10 @@ pub struct Config {
     pub peers: Vec<Peer>,
     pub data_dir: Option<PathBuf>,
     pub join: Option<String>,
+    /// Applied entries between snapshots; 0 never compacts the log. A quarter
+    /// as many entries are kept before each snapshot, so a follower that is
+    /// only briefly behind catches up from the log.
+    pub snapshot_every: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -96,6 +110,15 @@ struct Entry {
     command: Command,
 }
 
+/// The state machine as of log entry `index`, which replaces the log up to it.
+struct Snapshot {
+    index: usize,
+    term: u64,
+    config_index: usize,
+    membership: Membership,
+    data: HashMap<String, Value>,
+}
+
 pub(crate) enum RaftError {
     NotLeader {
         leader: Option<String>,
@@ -120,18 +143,31 @@ enum RpcOutcome {
 
 struct Inner {
     id: u64,
-    bootstrap: Membership,
     membership: Membership,
     config_index: usize,
     role: Role,
     current_term: u64,
     voted_for: Option<u64>,
+    /// Entries from index `log_base` on; `log[0]` is entry `log_base`. Below
+    /// that the log is compacted into the snapshot, and `log[0]` only gives
+    /// the term (at index 0, a sentinel). Use `entry` and `term_at` to index.
     log: Vec<Entry>,
+    log_base: usize,
+    /// The configuration in effect at `log_base`, and its index, used when the
+    /// remaining log holds none.
+    base_membership: (usize, Membership),
+    /// Index of the latest snapshot; at or above `log_base`.
+    snapshot_index: usize,
+    snapshot_every: usize,
+    /// The leader's latest snapshot, serialized, for followers that need it.
+    /// Usable while its index is at or above `log_base`.
+    snapshot_cache: Option<(usize, Arc<String>)>,
     /// Leading entries of `log` known to match the log file on disk; only
     /// entries past this are appended on the next persist.
     persisted: usize,
     /// Entries (lines) in the log file. More than `persisted` means the file
-    /// holds a truncated suffix or a torn line and is rewritten in full.
+    /// holds a truncated suffix, a torn line or an older base, and is
+    /// rewritten in full.
     on_disk: usize,
     commit_index: usize,
     last_applied: usize,
@@ -194,6 +230,7 @@ impl Node {
             config.id,
             bootstrap,
             config.data_dir,
+            config.snapshot_every,
             Arc::clone(&telemetry),
         );
         inner.load();
@@ -205,6 +242,7 @@ impl Node {
                 "term": inner.current_term,
                 "commit_index": inner.commit_index,
                 "log_entries": inner.last_index(),
+                "snapshot_index": inner.snapshot_index,
                 "voters": Membership::ids(&inner.membership.voters),
                 "learners": Membership::ids(&inner.membership.learners),
             }),
@@ -415,7 +453,7 @@ impl Node {
             // A new leader may hold an uncommitted configuration from an
             // earlier term; committing an entry of its own term first rules
             // that out (Ongaro, raft-dev 2015).
-            if inner.log[inner.commit_index].term != inner.current_term {
+            if inner.entry(inner.commit_index).term != inner.current_term {
                 return Err(RaftError::Busy(
                     "leader has not committed an entry in its term yet".into(),
                 ));
@@ -527,7 +565,7 @@ impl Node {
             tracing::warn!(node = inner.id, term, "linearizable read failed; no quorum");
             return Err(RaftError::Unavailable);
         }
-        if inner.log[inner.commit_index].term != term {
+        if inner.entry(inner.commit_index).term != term {
             tracing::debug!(
                 node = inner.id,
                 term,
@@ -624,16 +662,7 @@ impl Node {
                 "next_index": 1
             });
         }
-        if term > inner.current_term {
-            inner.observe_term(term);
-        } else if inner.role != Role::Follower {
-            inner.role = Role::Follower;
-            inner.fail_uncommitted();
-        }
-        if inner.leader_id != Some(leader_id) {
-            inner.note_leader(leader_id);
-        }
-        inner.refresh_follower_timer();
+        inner.follow(term, leader_id);
 
         let prev = u64_field(req, "prev_log_index").unwrap_or(0);
         let prev_term = u64_field(req, "prev_log_term").unwrap_or(0);
@@ -652,66 +681,78 @@ impl Node {
                 "next_index": next
             });
         }
-        let prev_index = prev as usize;
-        if inner.log[prev_index].term != prev_term {
-            tracing::info!(
-                node = inner.id,
-                leader = leader_id,
-                prev,
-                prev_term,
-                local_term = inner.log[prev_index].term,
-                "rejected append; log conflict"
-            );
-            return json!({
-                "term": inner.current_term,
-                "success": false,
-                "next_index": prev_index.max(1)
-            });
-        }
+        let entries = req
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let prev = prev as usize;
+        let (prev_index, entries) = if prev < inner.log_base {
+            // Entries up to the base are committed here, so they match the
+            // leader's: skip them, and the check of `prev_term`.
+            let skip = (inner.log_base - prev).min(entries.len());
+            (prev + skip, &entries[skip..])
+        } else {
+            if inner.term_at(prev) != Some(prev_term) {
+                tracing::info!(
+                    node = inner.id,
+                    leader = leader_id,
+                    prev,
+                    prev_term,
+                    local_term = inner.term_at(prev),
+                    "rejected append; log conflict"
+                );
+                return json!({
+                    "term": inner.current_term,
+                    "success": false,
+                    "next_index": prev.max(1)
+                });
+            }
+            (prev, entries)
+        };
 
         let mut dirty = false;
         let mut membership_changed = false;
-        if let Some(entries) = req.get("entries").and_then(|v| v.as_array()) {
-            for (offset, raw) in entries.iter().enumerate() {
-                let index = prev_index + 1 + offset;
-                let Some(entry) = parse_entry(raw) else {
-                    return json!({
-                        "term": inner.current_term,
-                        "success": false,
-                        "next_index": index.max(1)
-                    });
-                };
-                if index < inner.log.len() {
-                    if inner.log[index].term != entry.term {
-                        let dropped = inner.log.len().saturating_sub(index);
-                        tracing::info!(
-                            node = inner.id,
-                            index,
-                            kept = dropped,
-                            "truncated conflicting log suffix"
-                        );
-                        inner.telemetry.log_truncations.inc();
-                        inner.telemetry.event(
-                            "log_truncated",
-                            json!({ "index": index, "dropped": dropped, "leader": leader_id }),
-                        );
-                        inner.log.truncate(index);
-                        inner.persisted = inner.persisted.min(index);
-                        inner.log.push(entry);
-                        dirty = true;
-                        membership_changed = true;
-                    }
-                } else if index == inner.log.len() {
-                    membership_changed |= matches!(entry.command, Command::Config(_));
+        for (offset, raw) in entries.iter().enumerate() {
+            let index = prev_index + 1 + offset;
+            let Some(entry) = parse_entry(raw) else {
+                return json!({
+                    "term": inner.current_term,
+                    "success": false,
+                    "next_index": index.max(1)
+                });
+            };
+            if index <= inner.last_index() {
+                if inner.term_at(index) != Some(entry.term) {
+                    let dropped = inner.last_index() + 1 - index;
+                    tracing::info!(
+                        node = inner.id,
+                        index,
+                        kept = dropped,
+                        "truncated conflicting log suffix"
+                    );
+                    inner.telemetry.log_truncations.inc();
+                    inner.telemetry.event(
+                        "log_truncated",
+                        json!({ "index": index, "dropped": dropped, "leader": leader_id }),
+                    );
+                    let keep = index - inner.log_base;
+                    inner.log.truncate(keep);
+                    inner.persisted = inner.persisted.min(keep);
                     inner.log.push(entry);
                     dirty = true;
-                } else {
-                    return json!({
-                        "term": inner.current_term,
-                        "success": false,
-                        "next_index": inner.last_index() + 1
-                    });
+                    membership_changed = true;
                 }
+            } else if index == inner.last_index() + 1 {
+                membership_changed |= matches!(entry.command, Command::Config(_));
+                inner.log.push(entry);
+                dirty = true;
+            } else {
+                return json!({
+                    "term": inner.current_term,
+                    "success": false,
+                    "next_index": inner.last_index() + 1
+                });
             }
         }
         if membership_changed {
@@ -732,6 +773,49 @@ impl Node {
             "success": true,
             "next_index": inner.last_index() + 1
         })
+    }
+
+    /// Replace the state machine with the leader's snapshot (Raft §7). The
+    /// log after the snapshot is kept if it agrees with it, as a delayed
+    /// snapshot must not undo entries received since.
+    pub(crate) async fn handle_install_snapshot(&self, req: &Value) -> Value {
+        let mut inner = self.inner.lock().await;
+        let term = u64_field(req, "term").unwrap_or(0);
+        let leader_id = u64_field(req, "leader_id").unwrap_or(0);
+        if term < inner.current_term {
+            return json!({ "term": inner.current_term, "success": false });
+        }
+        inner.follow(term, leader_id);
+        let Some(snapshot) = req.get("snapshot").and_then(parse_snapshot) else {
+            tracing::warn!(node = inner.id, leader = leader_id, "unreadable snapshot");
+            return json!({ "term": inner.current_term, "success": false });
+        };
+        // Committed entries match the leader's, so a snapshot within them
+        // adds nothing.
+        if snapshot.index <= inner.commit_index {
+            return json!({ "term": inner.current_term, "success": true });
+        }
+        // Saved before the log is rewritten to start at it, so the log file
+        // never starts past the saved snapshot.
+        if let Some(dir) = inner.data_dir.clone() {
+            let text = req["snapshot"].to_string();
+            if let Err(err) = inner.write_snapshot(&dir, &text) {
+                inner.telemetry.persist_failures.inc();
+                tracing::error!(node = inner.id, %err, "failed to save installed snapshot");
+                return json!({ "term": inner.current_term, "success": false });
+            }
+        }
+        let index = snapshot.index;
+        let keys = snapshot.data.len();
+        inner.restore(snapshot);
+        inner.persist();
+        tracing::info!(node = inner.id, leader = leader_id, index, keys, "installed snapshot");
+        inner.telemetry.snapshots_installed.inc();
+        inner.telemetry.event(
+            "snapshot_installed",
+            json!({ "index": index, "keys": keys, "leader": leader_id }),
+        );
+        json!({ "term": inner.current_term, "success": true })
     }
 
     async fn tick_loop(self: Arc<Self>) {
@@ -1156,6 +1240,20 @@ impl Node {
         result
     }
 
+    async fn peer_post(
+        &self,
+        peer: &Peer,
+        path: &str,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let started = Instant::now();
+        let result = net::post_bytes(&peer.addr, path, body, timeout).await;
+        self.telemetry
+            .record_peer_rpc(peer.id, &peer.addr, started.elapsed(), &result);
+        result
+    }
+
     fn peer_lock(&self, id: u64) -> Arc<Mutex<()>> {
         let mut locks = self
             .peer_locks
@@ -1182,38 +1280,60 @@ impl Node {
             return RpcOutcome::Unreachable;
         }
         for _ in 0..128 {
-            let (term, request, last) = {
-                let inner = self.inner.lock().await;
+            // `matched` is how far the peer's log matches if it accepts.
+            let (term, request, matched, last) = {
+                let mut inner = self.inner.lock().await;
                 if inner.role != Role::Leader {
                     return RpcOutcome::Unreachable;
                 }
                 let term = inner.current_term;
                 let next = (*inner.next_index.get(&peer.id).unwrap_or(&1)).max(1);
                 let prev = next - 1;
-                let prev_term = inner.log.get(prev).map(|entry| entry.term).unwrap_or(0);
                 let last = inner.last_index();
-                let end = (next + 32).min(last + 1);
-                let entries = if next <= last {
-                    inner.log[next..end]
-                        .iter()
-                        .map(entry_json)
-                        .collect::<Vec<_>>()
+                let request = if prev < inner.log_base {
+                    // The entries the peer needs are compacted away.
+                    let (index, snapshot) = inner.snapshot_text();
+                    let body = format!(
+                        r#"{{"term":{term},"leader_id":{},"snapshot":{snapshot}}}"#,
+                        inner.id
+                    );
+                    Outbound::Snapshot { index, body }
                 } else {
-                    Vec::new()
+                    let end = (next + 32).min(last + 1);
+                    let entries = (next..end)
+                        .map(|index| entry_json(inner.entry(index)))
+                        .collect::<Vec<_>>();
+                    let count = entries.len();
+                    let request = json!({
+                        "term": term,
+                        "leader_id": inner.id,
+                        "prev_log_index": prev,
+                        "prev_log_term": inner.entry(prev).term,
+                        "entries": entries,
+                        "leader_commit": inner.commit_index,
+                    });
+                    Outbound::Append { matched: prev + count, request }
                 };
-                let request = json!({
-                    "term": term,
-                    "leader_id": inner.id,
-                    "prev_log_index": prev,
-                    "prev_log_term": prev_term,
-                    "entries": entries,
-                    "leader_commit": inner.commit_index,
-                });
-                (term, request, last)
+                let matched = match &request {
+                    Outbound::Append { matched, .. } => *matched,
+                    Outbound::Snapshot { index, .. } => *index,
+                };
+                (term, request, matched, last)
             };
 
             let sent = Instant::now();
-            let response = match self.peer_rpc(&peer, "/raft/append-entries", &request).await {
+            let result = match &request {
+                Outbound::Append { request, .. } => {
+                    self.peer_rpc(&peer, "/raft/append-entries", request).await
+                }
+                Outbound::Snapshot { index, body } => {
+                    // Retried every round while the peer is down, so quiet.
+                    tracing::debug!(node = self.id, peer = peer.id, index, bytes = body.len(), "sending snapshot");
+                    self.peer_post(&peer, "/raft/install-snapshot", body.as_bytes(), SNAPSHOT_RPC_TIMEOUT)
+                        .await
+                }
+            };
+            let response = match result {
                 Ok(response) => response,
                 Err(_) => return RpcOutcome::Unreachable,
             };
@@ -1241,13 +1361,10 @@ impl Node {
                 *acked = sent;
             }
             if success {
-                let count = request
-                    .get("entries")
-                    .and_then(|v| v.as_array())
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let prev = u64_field(&request, "prev_log_index").unwrap_or(0) as usize;
-                let matched = prev + count;
+                if matches!(request, Outbound::Snapshot { .. }) {
+                    tracing::info!(node = inner.id, peer = peer.id, index = matched, "peer took snapshot");
+                    self.telemetry.snapshots_sent.inc();
+                }
                 let slot = inner.match_index.entry(peer.id).or_insert(0);
                 if matched > *slot {
                     *slot = matched;
@@ -1272,10 +1389,13 @@ impl Node {
                 {
                     return RpcOutcome::CaughtUp;
                 }
+            } else if matches!(request, Outbound::Snapshot { .. }) {
+                // The peer could not save it; try again next round.
+                return RpcOutcome::Unreachable;
             } else {
                 let cur = (*inner.next_index.get(&peer.id).unwrap_or(&1)).max(1);
                 let hinted = u64_field(&response, "next_index").unwrap_or(1);
-                let hinted = hinted.min(inner.log.len() as u64) as usize;
+                let hinted = hinted.min(inner.last_index() as u64 + 1) as usize;
                 let mut next = if (1..cur).contains(&hinted) {
                     hinted
                 } else {
@@ -1292,6 +1412,13 @@ impl Node {
         }
         RpcOutcome::Unreachable
     }
+}
+
+/// One replication RPC to a peer.
+enum Outbound {
+    Append { matched: usize, request: Value },
+    /// The serialized `InstallSnapshot` request for a snapshot at `index`.
+    Snapshot { index: usize, body: String },
 }
 
 struct Departing {
@@ -1315,6 +1442,7 @@ impl Inner {
         id: u64,
         bootstrap: Membership,
         data_dir: Option<PathBuf>,
+        snapshot_every: usize,
         telemetry: Arc<Telemetry>,
     ) -> Self {
         let now = Instant::now();
@@ -1322,7 +1450,7 @@ impl Inner {
         Self {
             id,
             membership: bootstrap.clone(),
-            bootstrap,
+            base_membership: (0, bootstrap),
             config_index: 0,
             role: Role::Follower,
             current_term: 0,
@@ -1331,6 +1459,10 @@ impl Inner {
                 term: 0,
                 command: Command::Noop,
             }],
+            log_base: 0,
+            snapshot_index: 0,
+            snapshot_every,
+            snapshot_cache: None,
             persisted: 0,
             on_disk: 0,
             commit_index: 0,
@@ -1376,6 +1508,8 @@ impl Inner {
             commit_index: self.commit_index,
             applied_index: self.last_applied,
             last_index: self.last_index(),
+            snapshot_index: self.snapshot_index,
+            log_entries: self.log.len() - 1,
             voters: self.membership.voters.len(),
             learners: self.membership.learners.len(),
             keys: self.data.len(),
@@ -1390,6 +1524,20 @@ impl Inner {
             "leader_changed",
             json!({ "leader": leader, "term": self.current_term }),
         );
+    }
+
+    /// Accept `leader` as the leader of `term`, which is not older than ours.
+    fn follow(&mut self, term: u64, leader: u64) {
+        if term > self.current_term {
+            self.observe_term(term);
+        } else if self.role != Role::Follower {
+            self.role = Role::Follower;
+            self.fail_uncommitted();
+        }
+        if self.leader_id != Some(leader) {
+            self.note_leader(leader);
+        }
+        self.refresh_follower_timer();
     }
 
     fn refresh_follower_timer(&mut self) {
@@ -1425,19 +1573,22 @@ impl Inner {
         (index, rx)
     }
 
-    /// Adopt the latest configuration in the log, or the bootstrap peers if
-    /// the log has none.
-    fn refresh_membership(&mut self) {
-        let (index, membership) = self
-            .log
-            .iter()
-            .enumerate()
+    /// The configuration in effect at `index` and the index of its entry:
+    /// the latest one in the log up to there, else the one at the log base.
+    fn membership_at(&self, index: usize) -> (usize, Membership) {
+        ((self.log_base + 1)..=index.min(self.last_index()))
             .rev()
-            .find_map(|(index, entry)| match &entry.command {
+            .find_map(|index| match &self.entry(index).command {
                 Command::Config(membership) => Some((index, membership.clone())),
                 _ => None,
             })
-            .unwrap_or_else(|| (0, self.bootstrap.clone()));
+            .unwrap_or_else(|| self.base_membership.clone())
+    }
+
+    /// Adopt the latest configuration in the log, or the one in effect at
+    /// the log base (initially the bootstrap peers) if the log has none.
+    fn refresh_membership(&mut self) {
+        let (index, membership) = self.membership_at(self.last_index());
         if membership != self.membership {
             tracing::info!(
                 node = self.id,
@@ -1508,11 +1659,23 @@ impl Inner {
     }
 
     fn last_index(&self) -> usize {
-        self.log.len() - 1
+        self.log_base + self.log.len() - 1
     }
 
     fn last_term(&self) -> u64 {
-        self.log[self.last_index()].term
+        self.entry(self.last_index()).term
+    }
+
+    /// The entry at `index`, which must be in the log, from `log_base` to
+    /// `last_index`. The one at `log_base` has a reliable term only.
+    fn entry(&self, index: usize) -> &Entry {
+        &self.log[index - self.log_base]
+    }
+
+    /// Term of the entry at `index`, unless it is past the log or compacted.
+    fn term_at(&self, index: usize) -> Option<u64> {
+        let slot = index.checked_sub(self.log_base)?;
+        self.log.get(slot).map(|entry| entry.term)
     }
 
     fn other_voters(&self) -> Vec<Peer> {
@@ -1683,7 +1846,7 @@ impl Inner {
         let last = self.last_index();
         let mut commit = self.commit_index;
         for index in (self.commit_index + 1)..=last {
-            if self.log[index].term != self.current_term {
+            if self.entry(index).term != self.current_term {
                 continue;
             }
             let mut replicas = usize::from(self.is_voter());
@@ -1715,7 +1878,7 @@ impl Inner {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let index = self.last_applied;
-            match &self.log[index].command {
+            match &self.log[index - self.log_base].command {
                 Command::Put { key, value } => {
                     tracing::info!(node = self.id, index, key, "applied put");
                     self.data.insert(key.clone(), value.clone());
@@ -1735,6 +1898,121 @@ impl Inner {
                 let _ = waiter.send(true);
             }
         }
+        self.maybe_compact();
+    }
+
+    /// Once `snapshot_every` entries were applied since the last snapshot,
+    /// snapshot the applied state and drop the log before it, keeping a
+    /// quarter of `snapshot_every` entries for followers that are a little
+    /// behind. The log file is rewritten from the new base on the next
+    /// persist.
+    fn maybe_compact(&mut self) {
+        if self.snapshot_every == 0
+            || self.last_applied < self.snapshot_index + self.snapshot_every
+        {
+            return;
+        }
+        let index = self.last_applied;
+        let text = Arc::new(self.snapshot_json().to_string());
+        // Saved before the log shrinks, so the log file never starts past
+        // the saved snapshot.
+        if let Some(dir) = self.data_dir.clone() {
+            if let Err(err) = self.write_snapshot(&dir, &text) {
+                self.telemetry.persist_failures.inc();
+                tracing::error!(node = self.id, index, %err, "failed to save snapshot; log not compacted");
+                return;
+            }
+        }
+        let base = index
+            .saturating_sub(self.snapshot_every / 4)
+            .max(self.log_base);
+        self.base_membership = self.membership_at(base);
+        self.log.drain(..base - self.log_base);
+        self.log_base = base;
+        self.snapshot_index = index;
+        self.snapshot_cache = Some((index, text));
+        self.persisted = 0;
+        self.on_disk = usize::MAX;
+        tracing::info!(node = self.id, index, log_base = base, keys = self.data.len(), "took snapshot");
+        self.telemetry.snapshots_taken.inc();
+        self.telemetry.event(
+            "snapshot_taken",
+            json!({ "index": index, "log_base": base, "keys": self.data.len() }),
+        );
+    }
+
+    /// The applied state as a snapshot, in the snapshot file's format.
+    fn snapshot_json(&self) -> Value {
+        let index = self.last_applied;
+        let (config_index, membership) = self.membership_at(index);
+        json!({
+            "index": index,
+            "term": self.entry(index).term,
+            "config_index": config_index,
+            "voters": peers_json(&membership.voters),
+            "learners": peers_json(&membership.learners),
+            "data": self.data,
+        })
+    }
+
+    /// A serialized snapshot to send a follower that needs compacted entries,
+    /// and its index. Any snapshot from `log_base` on will do, as the log
+    /// continues from there, so one is reused until compaction passes it.
+    fn snapshot_text(&mut self) -> (usize, Arc<String>) {
+        if let Some((index, text)) = &self.snapshot_cache {
+            if *index >= self.log_base {
+                return (*index, Arc::clone(text));
+            }
+        }
+        let text = Arc::new(self.snapshot_json().to_string());
+        self.snapshot_cache = Some((self.last_applied, Arc::clone(&text)));
+        (self.last_applied, text)
+    }
+
+    fn write_snapshot(&self, dir: &Path, text: &str) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+        let path = dir.join(format!("{}.snapshot.json", self.id));
+        let tmp = dir.join(format!("{}.snapshot.json.tmp", self.id));
+        std::fs::write(&tmp, text)
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map_err(|err| err.to_string())
+    }
+
+    fn read_snapshot(&self, dir: &Path) -> Option<Snapshot> {
+        let path = dir.join(format!("{}.snapshot.json", self.id));
+        let bytes = std::fs::read(&path).ok()?;
+        let snapshot = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .as_ref()
+            .and_then(parse_snapshot);
+        if snapshot.is_none() {
+            tracing::error!(node = self.id, path = %path.display(), "ignoring unreadable snapshot");
+        }
+        snapshot
+    }
+
+    /// Replace the state machine with `snapshot`. Log entries after it are
+    /// kept if the log holds its last entry; otherwise the log restarts at
+    /// it. The log file is rewritten on the next persist.
+    fn restore(&mut self, snapshot: Snapshot) {
+        if self.term_at(snapshot.index) == Some(snapshot.term) {
+            self.log.drain(..snapshot.index - self.log_base);
+        } else {
+            self.log = vec![Entry {
+                term: snapshot.term,
+                command: Command::Noop,
+            }];
+        }
+        self.log_base = snapshot.index;
+        self.snapshot_index = snapshot.index;
+        self.snapshot_cache = None;
+        self.base_membership = (snapshot.config_index, snapshot.membership);
+        self.data = snapshot.data;
+        self.last_applied = snapshot.index;
+        self.commit_index = self.commit_index.max(snapshot.index);
+        self.persisted = 0;
+        self.on_disk = usize::MAX;
+        self.refresh_membership();
     }
 
     fn persist(&mut self) {
@@ -1750,8 +2028,10 @@ impl Inner {
     /// Save the log, then term, vote and commit index. The log file is
     /// appended to, one JSON entry per line, so a persist costs the new
     /// entries rather than the whole log; it is rewritten only after a
-    /// truncation. Entries go first so a saved commit index never points past
-    /// the saved log.
+    /// truncation or a compaction. Its first line is the entry at `log_base`,
+    /// as a noop carrying the base (absent, in files from before compaction,
+    /// for base 0). Entries go first so a saved commit index never points
+    /// past the saved log.
     fn write_state(&mut self) -> Result<(), String> {
         let Some(dir) = self.data_dir.clone() else {
             return Ok(());
@@ -1789,8 +2069,13 @@ impl Inner {
             return Ok(());
         }
         let mut lines = Vec::new();
-        for entry in &self.log[from..] {
-            serde_json::to_writer(&mut lines, &entry_json(entry)).map_err(|err| err.to_string())?;
+        for (slot, entry) in self.log.iter().enumerate().skip(from) {
+            let line = if slot == 0 {
+                json!({ "term": entry.term, "op": "noop", "base": self.log_base })
+            } else {
+                entry_json(entry)
+            };
+            serde_json::to_writer(&mut lines, &line).map_err(|err| err.to_string())?;
             lines.push(b'\n');
         }
         let result = if rewrite {
@@ -1815,21 +2100,29 @@ impl Inner {
     }
 
     /// Entries from the log file, stopping at the first line that does not
-    /// parse (a write torn by a crash), and how many lines the file holds.
-    fn read_log(&self, dir: &Path) -> Option<(Vec<Entry>, usize)> {
+    /// parse (a write torn by a crash), the index of the first, and how many
+    /// lines the file holds.
+    fn read_log(&self, dir: &Path) -> Option<(Vec<Entry>, usize, usize)> {
         let text = std::fs::read_to_string(dir.join(format!("{}.log.jsonl", self.id))).ok()?;
         let lines = text.lines().count();
+        let base = text
+            .lines()
+            .next()
+            .and_then(|line| serde_json::from_str::<Value>(line).ok())
+            .and_then(|first| u64_field(&first, "base"))
+            .unwrap_or(0) as usize;
         let entries = text
             .lines()
             .map_while(|line| serde_json::from_str::<Value>(line).ok().as_ref().and_then(parse_entry))
             .collect();
-        Some((entries, lines))
+        Some((entries, base, lines))
     }
 
     fn load(&mut self) {
-        let Some(dir) = &self.data_dir else {
+        let Some(dir) = self.data_dir.clone() else {
             return;
         };
+        let dir = &dir;
         let path = dir.join(format!("{}.json", self.id));
         let Ok(bytes) = std::fs::read(&path) else {
             tracing::debug!(node = self.id, path = %path.display(), "no raft state to load");
@@ -1841,8 +2134,8 @@ impl Inner {
         };
         // Older versions kept the log inside this file; it is moved to the
         // log file by the first persist.
-        let (log, on_disk) = match value.get("log").and_then(|v| v.as_array()) {
-            Some(entries) => (entries.iter().filter_map(parse_entry).collect(), usize::MAX),
+        let (log, base, on_disk) = match value.get("log").and_then(|v| v.as_array()) {
+            Some(entries) => (entries.iter().filter_map(parse_entry).collect(), 0, usize::MAX),
             // A torn last line leaves more lines than entries, which makes the
             // next persist rewrite the file.
             None => match self.read_log(dir) {
@@ -1859,16 +2152,40 @@ impl Inner {
         self.current_term = u64_field(&value, "current_term").unwrap_or(0);
         self.voted_for = value.get("voted_for").and_then(|v| v.as_u64());
         self.log = log;
-        self.refresh_membership();
+        self.log_base = base;
         let commit = u64_field(&value, "commit_index").unwrap_or(0) as usize;
         self.commit_index = commit.min(self.last_index());
-        self.last_applied = 0;
         self.data.clear();
+        self.last_applied = 0;
+        match self.read_snapshot(dir) {
+            Some(snapshot) => self.restore(snapshot),
+            None if base > 0 => {
+                // The snapshot is saved before the log is cut, so this
+                // takes a damaged data dir; the state is gone.
+                tracing::error!(
+                    node = self.id,
+                    base,
+                    "log starts past index 0 but there is no snapshot; discarding it"
+                );
+                self.log = vec![Entry {
+                    term: 0,
+                    command: Command::Noop,
+                }];
+                self.log_base = 0;
+                self.commit_index = 0;
+                self.persisted = 0;
+                self.on_disk = usize::MAX;
+            }
+            None => {}
+        }
+        self.commit_index = self.commit_index.min(self.last_index());
+        self.refresh_membership();
         self.apply();
         tracing::info!(
             node = self.id,
             term = self.current_term,
             commit = self.commit_index,
+            snapshot = self.snapshot_index,
             entries = self.last_index(),
             "loaded raft state"
         );
@@ -1962,6 +2279,24 @@ fn parse_peers(value: &Value) -> Option<Vec<Peer>> {
             })
         })
         .collect()
+}
+
+fn parse_snapshot(value: &Value) -> Option<Snapshot> {
+    Some(Snapshot {
+        index: u64_field(value, "index")? as usize,
+        term: u64_field(value, "term")?,
+        config_index: u64_field(value, "config_index")? as usize,
+        membership: Membership {
+            voters: parse_peers(value.get("voters")?)?,
+            learners: parse_peers(value.get("learners")?)?,
+        },
+        data: value
+            .get("data")?
+            .as_object()?
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    })
 }
 
 fn parse_entry(value: &Value) -> Option<Entry> {

@@ -9,7 +9,8 @@
 //! - every acknowledged write is readable with the value that was written;
 //! - no read returned a value older than one already acknowledged;
 //! - all members converge on the same applied state;
-//! - all members' persisted logs agree up to the lowest commit index;
+//! - all members' persisted logs agree up to the lowest commit index, where
+//!   both still hold the entries (a compacted prefix is not compared);
 //! - no term ever had two leaders.
 //!
 //! It runs for a while, so it is ignored by default:
@@ -18,7 +19,9 @@
 //!
 //! Environment knobs: CHAOS_SECS (default 30), CHAOS_NODES (5), CHAOS_CLIENTS
 //! (8), CHAOS_MAX_DOWN (members out at once; the default keeps a majority up,
-//! larger values allow full outages) and CHAOS_SEED. The seed fixes the fault
+//! larger values allow full outages), CHAOS_SNAPSHOT_EVERY (500 applied entries
+//! between snapshots, low so that compaction and snapshot installs happen under
+//! faults; 0 never compacts) and CHAOS_SEED. The seed fixes the fault
 //! and client decisions, not thread timing, so a rerun is similar, not
 //! identical. The data directory (raft state keyed by the random node ids
 //! printed at start, event journals, nodeN.log per member, fault timeline)
@@ -140,12 +143,14 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
         summary["max_down"] = json!(settings.max_down);
         summary["clients"] = json!(settings.clients);
         summary["nodes"] = json!(settings.nodes);
+        summary["snapshot_every"] = json!(settings.snapshot_every);
         summary["agreed_entries"] = json!(agreed);
-        // Raft state is ID.json plus, in newer versions, the ID.log.jsonl log.
+        // Raft state is ID.json plus, in newer versions, the ID.log.jsonl log
+        // and the ID.snapshot.json snapshot.
         summary["state_bytes_max"] = json!(ids
             .iter()
             .map(|id| {
-                [format!("{id}.json"), format!("{id}.log.jsonl")]
+                [format!("{id}.json"), format!("{id}.log.jsonl"), format!("{id}.snapshot.json")]
                     .iter()
                     .filter_map(|name| std::fs::metadata(dir.join(name)).ok())
                     .map(|meta| meta.len())
@@ -180,6 +185,7 @@ struct Settings {
     nodes: u64,
     clients: u64,
     max_down: usize,
+    snapshot_every: usize,
     seed: u64,
     keep: bool,
 }
@@ -194,6 +200,7 @@ impl Settings {
             nodes,
             clients: env_or("CHAOS_CLIENTS", 8),
             max_down: env_or("CHAOS_MAX_DOWN", ((nodes - 1) / 2) as usize),
+            snapshot_every: env_or("CHAOS_SNAPSHOT_EVERY", 500),
             seed: env_or("CHAOS_SEED", clock % 1_000_000_000),
             keep: env_or("CHAOS_KEEP", 0u8) != 0,
         }
@@ -334,6 +341,7 @@ struct Cluster {
     started: Instant,
     timeline: Vec<String>,
     unexpected_exits: Vec<String>,
+    snapshot_every: usize,
 }
 
 impl Cluster {
@@ -361,6 +369,7 @@ impl Cluster {
             started: Instant::now(),
             timeline: Vec::new(),
             unexpected_exits: Vec::new(),
+            snapshot_every: settings.snapshot_every,
         };
         for index in 0..cluster.members.len() {
             cluster.spawn(index);
@@ -385,7 +394,9 @@ impl Cluster {
             .arg("--listen")
             .arg(&member.addr)
             .arg("--data-dir")
-            .arg(&self.dir);
+            .arg(&self.dir)
+            .arg("--snapshot-every")
+            .arg(self.snapshot_every.to_string());
         for peer in self.members.iter().filter(|m| m.n != member.n) {
             command.arg("--peer").arg(&peer.addr);
         }
@@ -792,8 +803,9 @@ async fn verify(addrs: &Arc<Vec<String>>, logs: &[ClientLog]) -> Vec<String> {
     violations
 }
 
-/// Compare persisted logs up to the lowest commit index any member saved.
-/// Returns that index and any divergence found.
+/// Compare persisted logs up to the lowest commit index any member saved,
+/// over the entries each pair still holds. Returns that index and any
+/// divergence found.
 fn check_logs(dir: &Path, ids: &[u64]) -> (usize, Vec<String>) {
     let mut states = Vec::new();
     for id in ids {
@@ -809,11 +821,13 @@ fn check_logs(dir: &Path, ids: &[u64]) -> (usize, Vec<String>) {
         .min()
         .unwrap_or(0);
     // The log is in ID.log.jsonl, one entry per line (a line torn by a kill
-    // ends it), or inside ID.json in older versions. Entry 0 is a sentinel.
-    let logs: Vec<(u64, Vec<Value>)> = states
+    // ends it), or inside ID.json in older versions. The first line stands for
+    // the entry at the log's base: the "base" it carries after compaction,
+    // else the sentinel entry 0. Line i is entry base + i.
+    let logs: Vec<(u64, usize, Vec<Value>)> = states
         .iter()
         .map(|(id, state)| {
-            let log = match state["log"].as_array() {
+            let log: Vec<Value> = match state["log"].as_array() {
                 Some(log) => log.clone(),
                 None => std::fs::read_to_string(dir.join(format!("{id}.log.jsonl")))
                     .unwrap_or_default()
@@ -821,21 +835,24 @@ fn check_logs(dir: &Path, ids: &[u64]) -> (usize, Vec<String>) {
                     .map_while(|line| serde_json::from_str(line).ok())
                     .collect(),
             };
-            (*id, log)
+            let base = log.first().and_then(|first| first["base"].as_u64()).unwrap_or(0) as usize;
+            (*id, base, log)
         })
         .collect();
     let mut violations = Vec::new();
-    let (first_id, first) = &logs[0];
-    for (id, log) in &logs[1..] {
-        if log.len() <= commit || first.len() <= commit {
+    let (first_id, first_base, first) = &logs[0];
+    for (id, base, log) in &logs[1..] {
+        if base + log.len() <= commit || first_base + first.len() <= commit {
             violations.push(format!("node {id} or {first_id} saved fewer than {commit} committed entries"));
             continue;
         }
-        if let Some(index) = (1..=commit).find(|&i| log[i] != first[i]) {
+        // Entries at or below either base are compacted into a snapshot.
+        let from = (*base).max(*first_base) + 1;
+        if let Some(index) = (from..=commit).find(|&i| log[i - base] != first[i - first_base]) {
             violations.push(format!(
                 "committed entry {index} differs: node {first_id} has {}, node {id} has {}",
-                first[index],
-                log[index]
+                first[index - first_base],
+                log[index - base]
             ));
         }
     }

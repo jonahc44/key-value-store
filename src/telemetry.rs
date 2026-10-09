@@ -231,6 +231,9 @@ pub(crate) struct Gauges {
     pub(crate) commit_index: usize,
     pub(crate) applied_index: usize,
     pub(crate) last_index: usize,
+    pub(crate) snapshot_index: usize,
+    /// Log entries held after the log base.
+    pub(crate) log_entries: usize,
     pub(crate) voters: usize,
     pub(crate) learners: usize,
     pub(crate) keys: usize,
@@ -259,6 +262,9 @@ pub(crate) struct Telemetry {
     pub(crate) proposals_lost_leadership: Counter,
     pub(crate) read_quorum_failures: Counter,
     pub(crate) log_truncations: Counter,
+    pub(crate) snapshots_taken: Counter,
+    pub(crate) snapshots_sent: Counter,
+    pub(crate) snapshots_installed: Counter,
     pub(crate) persist_failures: Counter,
     pub(crate) forwards_ok: Counter,
     pub(crate) forwards_failed: Counter,
@@ -295,6 +301,9 @@ impl Telemetry {
             proposals_lost_leadership: Counter::default(),
             read_quorum_failures: Counter::default(),
             log_truncations: Counter::default(),
+            snapshots_taken: Counter::default(),
+            snapshots_sent: Counter::default(),
+            snapshots_installed: Counter::default(),
             persist_failures: Counter::default(),
             forwards_ok: Counter::default(),
             forwards_failed: Counter::default(),
@@ -519,6 +528,10 @@ impl Telemetry {
             "commit_index": gauges.commit_index,
             "applied_index": gauges.applied_index,
             "log_entries": gauges.last_index,
+            "snapshot_index": gauges.snapshot_index,
+            "log_entries_held": gauges.log_entries,
+            "snapshots_taken": self.snapshots_taken.get(),
+            "snapshots_installed": self.snapshots_installed.get(),
             "keys": gauges.keys,
             "voters": gauges.voters,
             "learners": gauges.learners,
@@ -605,6 +618,18 @@ impl Telemetry {
         );
         gauge(
             o,
+            "raft_snapshot_index",
+            "Last log index covered by this member's snapshot.",
+            gauges.snapshot_index,
+        );
+        gauge(
+            o,
+            "raft_log_entries",
+            "Log entries held in memory, after the compacted prefix.",
+            gauges.log_entries,
+        );
+        gauge(
+            o,
             "raft_voters",
             "Voting members in the configuration.",
             gauges.voters,
@@ -681,6 +706,24 @@ impl Telemetry {
             "raft_log_truncations_total",
             "Conflicting log suffixes discarded.",
             &self.log_truncations,
+        );
+        counter(
+            o,
+            "raft_snapshots_taken_total",
+            "Snapshots taken to compact the log.",
+            &self.snapshots_taken,
+        );
+        counter(
+            o,
+            "raft_snapshots_sent_total",
+            "Snapshots followers behind the compacted log accepted.",
+            &self.snapshots_sent,
+        );
+        counter(
+            o,
+            "raft_snapshots_installed_total",
+            "Snapshots received from the leader and installed.",
+            &self.snapshots_installed,
         );
         counter(
             o,

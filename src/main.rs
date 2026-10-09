@@ -1,4 +1,4 @@
-use key_value_store::{Options, run};
+use key_value_store::{DEFAULT_SNAPSHOT_EVERY, Options, run};
 
 #[tokio::main]
 async fn main() {
@@ -31,6 +31,7 @@ fn parse_args() -> Result<Options, String> {
     let mut peers = Vec::new();
     let mut data_dir = None;
     let mut join = None;
+    let mut snapshot_every = DEFAULT_SNAPSHOT_EVERY;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -70,6 +71,12 @@ fn parse_args() -> Result<Options, String> {
                         .ok_or_else(|| "--join needs an address".to_string())?,
                 );
             }
+            "--snapshot-every" => {
+                snapshot_every = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .ok_or_else(|| "--snapshot-every needs a number of entries".to_string())?;
+            }
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
     }
@@ -81,11 +88,13 @@ fn parse_args() -> Result<Options, String> {
         peers,
         data_dir,
         join,
+        snapshot_every,
     })
 }
 
 fn usage() -> &'static str {
     "usage: key-value-store [--listen ADDR] [--peer ADDR]... [--join ADDR] [--data-dir PATH]\n\
+                       [--snapshot-every N]\n\
      \n\
      One process is one member of a Raft cluster. To bootstrap a cluster, pass\n\
      every initial member, including this one, via --peer. With no --peer flags\n\
@@ -110,6 +119,12 @@ fn usage() -> &'static str {
      POST   /cluster/members   {\"id\": N, \"addr\": \"HOST:PORT\"} adds a member\n\
      GET    /cluster/metrics   Prometheus metrics for this member and its peers\n\
      GET    /cluster/events    recent events: peers dropping out, elections, ...\n\
+     \n\
+     The log is compacted: every N applied entries (--snapshot-every, default\n\
+     8192; 0 never compacts) a member snapshots its keys and drops the log\n\
+     before them, so memory, disk and restart time track the key space\n\
+     rather than the write history. With --data-dir the snapshot is saved in\n\
+     DATA_DIR/ID.snapshot.json. A member too far behind gets the snapshot.\n\
      \n\
      With --data-dir, events and a stats snapshot every minute are also\n\
      appended to DATA_DIR/ID.events.jsonl for analysis over time.\n\

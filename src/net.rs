@@ -29,14 +29,24 @@ pub(crate) async fn call(
 
 pub async fn post_json(addr: &str, path: &str, body: &Value) -> Result<Value, String> {
     let bytes = serde_json::to_vec(body).map_err(|err| err.to_string())?;
+    post_bytes(addr, path, &bytes, RPC_TIMEOUT).await
+}
+
+/// POST an already serialized JSON body and parse the JSON reply.
+pub(crate) async fn post_bytes(
+    addr: &str,
+    path: &str,
+    bytes: &[u8],
+    timeout: Duration,
+) -> Result<Value, String> {
     let result = async {
         let (status, response) = tokio::time::timeout(
-            RPC_TIMEOUT,
+            timeout,
             request(
                 addr,
                 "POST",
                 path,
-                Some(&bytes),
+                Some(bytes),
                 &[("content-type", "application/json")],
             ),
         )
