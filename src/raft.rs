@@ -20,6 +20,7 @@
 //! history. A follower that needs entries the leader has dropped, such as a
 //! new learner, is sent the leader's snapshot instead.
 
+use crate::keyspace::KeySpace;
 use crate::net;
 use crate::telemetry::{Gauges, Telemetry};
 use serde_json::{Value, json};
@@ -111,8 +112,8 @@ struct Entry {
 }
 
 /// The state machine as of log entry `index`, which replaces the log up to it.
-/// The key space is a persistent map, so a copy taken under the node lock is
-/// O(1) and stays frozen while later writes go on (Raft thesis §5.1.1);
+/// The key space is copy-on-write, so a copy taken under the node lock is
+/// cheap and stays frozen while later writes go on (Raft thesis §5.1.1);
 /// serializing and saving it happens outside the lock.
 struct Snapshot {
     index: usize,
@@ -121,8 +122,6 @@ struct Snapshot {
     membership: Membership,
     data: KeySpace,
 }
-
-type KeySpace = imbl::HashMap<String, Value>;
 
 impl Snapshot {
     /// The snapshot file's format, which is also the body of InstallSnapshot.
@@ -142,7 +141,7 @@ impl Snapshot {
             if n > 0 {
                 text.push(',');
             }
-            text.push_str(&Value::from(key.as_str()).to_string());
+            text.push_str(&Value::from(key).to_string());
             text.push(':');
             text.push_str(&value.to_string());
         }
@@ -2103,8 +2102,8 @@ impl Inner {
         }
     }
 
-    /// The applied state as a snapshot. O(1): the key space is shared with
-    /// later writes rather than copied.
+    /// The applied state as a snapshot. Cheap: the key space's shards are
+    /// shared with later writes rather than copied.
     fn capture(&self) -> Snapshot {
         let index = self.last_applied;
         let (config_index, membership) = self.membership_at(index);

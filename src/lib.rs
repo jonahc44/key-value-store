@@ -4,6 +4,7 @@
 
 mod api;
 mod identity;
+mod keyspace;
 mod net;
 mod raft;
 mod telemetry;
