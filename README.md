@@ -18,16 +18,12 @@ The system is a single Rust binary, `key-value-store`; each process is one membe
 | `src/lib.rs` | `run()` entry point plus most unit and integration tests |
 | `tests/chaos.rs` | Multi-process fault-injection stress test |
 
-## Prerequisites and building
-
-You need a Rust toolchain that supports edition 2024 (Rust 1.85 or newer; tested with 1.99), plus `curl` for trying the API. The chaos test needs a Unix system because it sends SIGKILL and SIGSTOP to members.
+## Building
 
 ```bash
 cargo build --release          # binary at target/release/key-value-store
 ./target/release/key-value-store --help
 ```
-
-Use release builds for anything timing-sensitive: multi-node runs, the chaos test and benchmarks. Debug builds work for unit tests but elections and fsync paths are slower.
 
 ## Running the system
 
