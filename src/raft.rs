@@ -961,9 +961,13 @@ impl Node {
             inner.refresh_membership();
         }
 
+        // Only entries this request vouched for may commit: past them the
+        // log may hold an old term's entries not yet checked against the
+        // leader's (Raft Figure 2). The commit index never moves back.
         let leader_commit = u64_field(req, "leader_commit").unwrap_or(0) as usize;
-        if leader_commit > inner.commit_index {
-            inner.commit_index = leader_commit.min(inner.last_index());
+        let new_commit = leader_commit.min(prev_index + entries.len());
+        if new_commit > inner.commit_index {
+            inner.commit_index = new_commit;
             inner.apply();
             dirty = true;
         }
