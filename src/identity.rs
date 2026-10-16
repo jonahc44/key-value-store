@@ -1,6 +1,7 @@
 //! Node identity. Each process picks a random id the first time it runs and,
 //! with a data dir, keeps it across restarts. Bootstrap peers are given by
-//! address only; their ids are learned by asking each one over HTTP.
+//! address only; their ids are learned by asking each one over HTTP, which
+//! also checks that they all agree on the quorum setting.
 
 use crate::net;
 use crate::raft::Peer;
@@ -20,19 +21,33 @@ const ID_MASK: u64 = (1 << 53) - 1;
 pub(crate) struct Identity {
     pub id: u64,
     pub peers: Vec<Peer>,
+    /// The `--asymmetric-quorum` setting the member was first started with.
+    pub asymmetric_quorum: bool,
 }
 
 /// Load this member's saved identity, or pick a random id and learn the ids
 /// of `peers`. While discovering, `listener` answers `GET /cluster/id` so
 /// peers starting at the same time can learn this member's id in turn.
+///
+/// Members must agree on `asymmetric_quorum`: a member committing with a
+/// smaller quorum than the others elect against could lose writes. Startup
+/// fails if a bootstrap peer, or this member's saved identity, disagrees.
 pub(crate) async fn resolve(
     listener: &std::net::TcpListener,
     listen: &str,
     peers: &[String],
     data_dir: Option<&PathBuf>,
+    asymmetric_quorum: bool,
 ) -> std::io::Result<Identity> {
     let path = data_dir.map(|dir| identity_path(dir, listen));
     if let Some(identity) = path.as_deref().and_then(load) {
+        if identity.asymmetric_quorum != asymmetric_quorum {
+            return Err(std::io::Error::other(format!(
+                "member {} was created with asymmetric quorums {}; it cannot be changed on restart",
+                identity.id,
+                if identity.asymmetric_quorum { "on" } else { "off" },
+            )));
+        }
         tracing::info!(node = identity.id, "using saved node id {}", identity.id);
         return Ok(identity);
     }
@@ -41,9 +56,13 @@ pub(crate) async fn resolve(
     let peers = if peers.is_empty() {
         Vec::new()
     } else {
-        discover(listener, id, peers).await?
+        discover(listener, id, peers, asymmetric_quorum).await?
     };
-    let identity = Identity { id, peers };
+    let identity = Identity {
+        id,
+        peers,
+        asymmetric_quorum,
+    };
     if let Some(path) = &path {
         save(path, &identity)?;
     }
@@ -92,7 +111,16 @@ fn load(path: &Path) -> Option<Identity> {
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    Some(Identity { id, peers })
+    // Saved before the setting existed: majorities were used.
+    let asymmetric_quorum = value
+        .get("asymmetric_quorum")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Some(Identity {
+        id,
+        peers,
+        asymmetric_quorum,
+    })
 }
 
 /// Saved durably: a member that forgot its id after a crash would rejoin
@@ -108,7 +136,11 @@ fn save(path: &Path, identity: &Identity) -> std::io::Result<()> {
         .iter()
         .map(|peer| json!({ "id": peer.id, "addr": peer.addr }))
         .collect();
-    let body = json!({ "id": identity.id, "peers": peers });
+    let body = json!({
+        "id": identity.id,
+        "peers": peers,
+        "asymmetric_quorum": identity.asymmetric_quorum,
+    });
     crate::raft::write_durably(dir, name, &serde_json::to_vec(&body).unwrap_or_default())
 }
 
@@ -116,6 +148,7 @@ async fn discover(
     listener: &std::net::TcpListener,
     id: u64,
     addrs: &[String],
+    asymmetric_quorum: bool,
 ) -> std::io::Result<Vec<Peer>> {
     let announce = tokio::net::TcpListener::from_std(listener.try_clone()?)?;
     // Clients may reach this member before it serves the real API. A 404
@@ -123,7 +156,9 @@ async fn discover(
     let app = Router::new()
         .route(
             "/cluster/id",
-            get(move || async move { Json(json!({ "id": id })) }),
+            get(move || async move {
+                Json(json!({ "id": id, "asymmetric_quorum": asymmetric_quorum }))
+            }),
         )
         .fallback(|| async {
             (
@@ -141,9 +176,13 @@ async fn discover(
     });
 
     let mut peers = Vec::new();
+    let mut mismatch = None;
     for addr in addrs {
-        let peer_id = peer_id(addr).await;
+        let (peer_id, peer_asymmetric) = peer_id(addr).await;
         tracing::info!(node = id, peer = peer_id, %addr, "discovered peer");
+        if peer_asymmetric != asymmetric_quorum {
+            mismatch.get_or_insert_with(|| addr.clone());
+        }
         peers.push(Peer {
             id: peer_id,
             addr: addr.clone(),
@@ -152,20 +191,30 @@ async fn discover(
 
     let _ = stop.send(());
     let _ = server.await;
+    if let Some(addr) = mismatch {
+        return Err(std::io::Error::other(format!(
+            "peer {addr} disagrees on --asymmetric-quorum; start every initial member with the same setting"
+        )));
+    }
     Ok(peers)
 }
 
-/// Ask `addr` for its id, retrying until it answers.
-async fn peer_id(addr: &str) -> u64 {
+/// Ask `addr` for its id and quorum setting, retrying until it answers.
+async fn peer_id(addr: &str) -> (u64, bool) {
     let mut attempts = 0u32;
     loop {
         let reply = net::call(addr, "GET", "/cluster/id", None).await;
-        let id = reply.as_ref().ok().and_then(|(status, body)| {
+        let answer = reply.as_ref().ok().and_then(|(status, body)| {
             let value: Value = serde_json::from_slice(body).ok()?;
-            (*status == 200).then(|| value.get("id")?.as_u64())?
+            let id = (*status == 200).then(|| value.get("id")?.as_u64())??;
+            let asymmetric = value
+                .get("asymmetric_quorum")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Some((id, asymmetric))
         });
-        if let Some(id) = id {
-            return id;
+        if let Some(answer) = answer {
+            return answer;
         }
         if attempts % 10 == 0 {
             tracing::info!(%addr, "waiting for peer to come up");
@@ -198,8 +247,8 @@ mod tests {
             b.local_addr().unwrap().to_string(),
         ];
         let (first, second) = tokio::join!(
-            resolve(&a, &addrs[0], &addrs, None),
-            resolve(&b, &addrs[1], &addrs, None),
+            resolve(&a, &addrs[0], &addrs, None, false),
+            resolve(&b, &addrs[1], &addrs, None, false),
         );
         let (first, second) = (first.unwrap(), second.unwrap());
         assert_ne!(first.id, second.id);
@@ -209,14 +258,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peers_must_agree_on_asymmetric_quorum() {
+        let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        a.set_nonblocking(true).unwrap();
+        b.set_nonblocking(true).unwrap();
+        let addrs = vec![
+            a.local_addr().unwrap().to_string(),
+            b.local_addr().unwrap().to_string(),
+        ];
+        // A member that stops discovering stops answering, so one side may
+        // wait for the other forever; neither may start.
+        let limit = Duration::from_secs(5);
+        let (first, second) = tokio::join!(
+            tokio::time::timeout(limit, resolve(&a, &addrs[0], &addrs, None, true)),
+            tokio::time::timeout(limit, resolve(&b, &addrs[1], &addrs, None, false)),
+        );
+        assert!(!matches!(first, Ok(Ok(_))));
+        assert!(!matches!(second, Ok(Ok(_))));
+        assert!(matches!(first, Ok(Err(_))) || matches!(second, Ok(Err(_))));
+    }
+
+    #[tokio::test]
     async fn saved_identity_is_reused() {
         let dir = std::env::temp_dir().join(format!("kv-identity-{}", random_id()));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let listen = listener.local_addr().unwrap().to_string();
-        let first = resolve(&listener, &listen, &[], Some(&dir)).await.unwrap();
-        let again = resolve(&listener, &listen, &[], Some(&dir)).await.unwrap();
+        let first = resolve(&listener, &listen, &[], Some(&dir), true).await.unwrap();
+        let again = resolve(&listener, &listen, &[], Some(&dir), true).await.unwrap();
         assert_eq!(first.id, again.id);
+        assert!(again.asymmetric_quorum);
+        // The quorum setting is fixed once the member exists.
+        assert!(resolve(&listener, &listen, &[], Some(&dir), false).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

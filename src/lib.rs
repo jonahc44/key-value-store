@@ -1,6 +1,6 @@
 //! Distributed key-value store. A Raft group keeps the key space consistent
 //! and partition tolerant: a write or linearizable read is acknowledged only
-//! after a majority has accepted the leader. Members can be added at runtime.
+//! after a quorum has accepted the leader. Members can be added at runtime.
 
 mod api;
 mod identity;
@@ -29,6 +29,9 @@ pub struct Options {
     pub join: Option<String>,
     pub snapshot_every: usize,
     pub snapshot_chunk: usize,
+    /// Opt in to asymmetric quorums with an odd number of voters; see
+    /// [`ServerConfig::asymmetric_quorum`].
+    pub asymmetric_quorum: bool,
 }
 
 /// Resolve this member's id (random on first start, saved under the data
@@ -41,6 +44,7 @@ pub async fn run(options: Options) -> std::io::Result<()> {
         &options.listen,
         &options.peers,
         options.data_dir.as_ref(),
+        options.asymmetric_quorum,
     )
     .await?;
     let config = Config {
@@ -51,6 +55,7 @@ pub async fn run(options: Options) -> std::io::Result<()> {
         join: options.join,
         snapshot_every: options.snapshot_every,
         snapshot_chunk: options.snapshot_chunk,
+        asymmetric_quorum: options.asymmetric_quorum,
     };
     serve_on(tokio::net::TcpListener::from_std(listener)?, config).await
 }
@@ -175,6 +180,15 @@ mod tests {
         data_dir: Option<std::path::PathBuf>,
         snapshot_every: usize,
     ) -> Vec<Running> {
+        cluster_opts(size, data_dir, snapshot_every, false).await
+    }
+
+    async fn cluster_opts(
+        size: u64,
+        data_dir: Option<std::path::PathBuf>,
+        snapshot_every: usize,
+        asymmetric_quorum: bool,
+    ) -> Vec<Running> {
         let mut listeners = Vec::new();
         let mut peers = Vec::new();
         for id in 1..=size {
@@ -196,6 +210,7 @@ mod tests {
                     join: None,
                     snapshot_every,
                     snapshot_chunk: TEST_SNAPSHOT_CHUNK,
+                    asymmetric_quorum,
                 },
             ));
         }
@@ -216,6 +231,7 @@ mod tests {
                 join: Some(seed.to_string()),
                 snapshot_every: DEFAULT_SNAPSHOT_EVERY,
                 snapshot_chunk: DEFAULT_SNAPSHOT_CHUNK,
+                asymmetric_quorum: false,
             },
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -540,6 +556,7 @@ mod tests {
                         join: None,
                         snapshot_every: DEFAULT_SNAPSHOT_EVERY,
                         snapshot_chunk: DEFAULT_SNAPSHOT_CHUNK,
+                        asymmetric_quorum: false,
                     },
                 )
             })
@@ -602,9 +619,8 @@ mod tests {
         let joiner = nodes.iter().find(|n| n.node.id() == 4).unwrap();
         wait_local(&joiner.node, "late", &json!({"v": 2})).await;
 
-        // Two of four is not a majority.
-        let original = nodes.iter().position(|n| n.node.id() != 4).unwrap();
-        nodes.remove(original).stop().await;
+        // Two of four could commit under a leader, but cannot elect one.
+        nodes.remove(next).stop().await;
         let survivor = nodes[0].addr.clone();
         let (status, _) = put(&survivor, "split", json!({"v": 3})).await;
         assert_eq!(status, 503);
@@ -645,19 +661,147 @@ mod tests {
         let joiner = join(2, &seed).await;
         wait_local(&joiner.node, "a", &json!({"v": 1})).await;
         assert_eq!(voters(&nodes[0].node).await, vec![1, 2]);
-        assert_eq!(voters(&joiner.node).await, vec![1, 2]);
+        // The leader alone commits the promotion, so the joiner may hear of
+        // it a moment later.
+        let start = Instant::now();
+        while voters(&joiner.node).await != vec![1, 2] {
+            assert!(start.elapsed() < Duration::from_secs(3), "joiner never promoted");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         // Repeating the same join is a no-op; reusing the id elsewhere is not.
         super::join_cluster(&seed, 2, &joiner.addr).await.unwrap();
         let conflict = super::join_cluster(&seed, 2, "127.0.0.1:1").await;
         assert!(conflict.unwrap_err().contains("already exists"));
 
-        // With two voters, losing the new one means no majority.
+        // With two voters the leader commits on its own (a commit quorum of
+        // one), though it takes both to elect a leader.
         joiner.stop().await;
         let (status, _) = put(&seed, "b", json!({"v": 2})).await;
-        assert_eq!(status, 503);
+        assert_eq!(status, 201);
 
         nodes.pop().unwrap().stop().await;
+    }
+
+    async fn quorums(node: &Node) -> (u64, u64) {
+        let membership = node.membership().await;
+        (
+            membership["election_quorum"].as_u64().unwrap(),
+            membership["commit_quorum"].as_u64().unwrap(),
+        )
+    }
+
+    /// Stop every node but the leader and `others` more, returning the
+    /// survivors with the leader first.
+    async fn keep_leader_and(mut nodes: Vec<Running>, others: usize) -> Vec<Running> {
+        let leader = wait_leader(&nodes).await;
+        let mut kept = vec![nodes.remove(leader)];
+        kept.extend(nodes.drain(..others));
+        for node in nodes {
+            node.stop().await;
+        }
+        kept
+    }
+
+    #[tokio::test]
+    async fn even_cluster_commits_with_half() {
+        let nodes = cluster(4, None).await;
+        let leader = wait_leader(&nodes).await;
+        assert_eq!(quorums(&nodes[leader].node).await, (3, 2));
+        assert_eq!(put(&nodes[leader].addr, "a", json!({"v": 1})).await.0, 201);
+
+        // Two of four voters, the leader among them, still commit and read.
+        let nodes = keep_leader_and(nodes, 1).await;
+        let created = put(&nodes[0].addr, "b", json!({"v": 2})).await;
+        assert_eq!(created.0, 201, "{created:?}");
+        assert_eq!(get(&nodes[1].addr, "b").await, (200, json!({"v": 2})));
+
+        for node in nodes {
+            node.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn even_cluster_cannot_elect_with_half() {
+        let mut nodes = cluster(4, None).await;
+        let leader = wait_leader(&nodes).await;
+        assert_eq!(put(&nodes[leader].addr, "a", json!({"v": 1})).await.0, 201);
+
+        // Stop the leader and one follower: two voters remain, one short of
+        // the three an election needs.
+        nodes.remove(leader).stop().await;
+        nodes.remove(0).stop().await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        for node in &nodes {
+            assert!(!node.node.is_leader().await, "node {} won", node.node.id());
+        }
+        let (status, _) = put(&nodes[0].addr, "b", json!({"v": 2})).await;
+        assert_eq!(status, 503);
+
+        for node in nodes {
+            node.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn odd_cluster_uses_majorities_unless_opted_in() {
+        let nodes = cluster(3, None).await;
+        let leader = wait_leader(&nodes).await;
+        assert_eq!(quorums(&nodes[leader].node).await, (2, 2));
+        for node in nodes {
+            node.stop().await;
+        }
+
+        let nodes = cluster_opts(3, None, DEFAULT_SNAPSHOT_EVERY, true).await;
+        let leader = wait_leader(&nodes).await;
+        assert_eq!(quorums(&nodes[leader].node).await, (3, 1));
+
+        // The leader alone is a commit quorum.
+        let nodes = keep_leader_and(nodes, 0).await;
+        let created = put(&nodes[0].addr, "a", json!({"v": 1})).await;
+        assert_eq!(created.0, 201, "{created:?}");
+        assert_eq!(get(&nodes[0].addr, "a").await, (200, json!({"v": 1})));
+        for node in nodes {
+            node.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn opted_in_odd_cluster_needs_every_voter_to_elect() {
+        let mut nodes = cluster_opts(3, None, DEFAULT_SNAPSHOT_EVERY, true).await;
+        let leader = wait_leader(&nodes).await;
+        nodes.remove(leader).stop().await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        for node in &nodes {
+            assert!(!node.node.is_leader().await, "node {} won", node.node.id());
+        }
+        for node in nodes {
+            node.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn joiners_inherit_asymmetric_quorum() {
+        let nodes = cluster_opts(3, None, DEFAULT_SNAPSHOT_EVERY, true).await;
+        let leader = wait_leader(&nodes).await;
+        let seed = nodes[leader].addr.clone();
+        let fourth = join(4, &seed).await;
+        let fifth = join(5, &seed).await;
+        // Five voters, still opted in: commit with two, elect with four.
+        let nodes: Vec<Running> = nodes.into_iter().chain([fourth, fifth]).collect();
+        for node in &nodes {
+            let start = Instant::now();
+            while quorums(&node.node).await != (4, 2) {
+                assert!(start.elapsed() < Duration::from_secs(3), "node {}", node.node.id());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(node.node.membership().await["asymmetric_quorum"], json!(true));
+        }
+        let created = put(&seed, "a", json!({"v": 1})).await;
+        assert_eq!(created.0, 201, "{created:?}");
+        for node in nodes {
+            node.stop().await;
+        }
     }
 
     async fn remove(addr: &str, id: u64) -> (u16, serde_json::Value) {

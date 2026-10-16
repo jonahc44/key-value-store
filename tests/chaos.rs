@@ -23,7 +23,8 @@
 //! between snapshots, low so that compaction and snapshot installs happen under
 //! faults; 0 never compacts), CHAOS_SNAPSHOT_CHUNK (4096 bytes per snapshot
 //! request, small so transfers span many requests and kills land mid-transfer)
-//! and CHAOS_SEED. The seed fixes the fault
+//! CHAOS_ASYMMETRIC=1 (pass --asymmetric-quorum; with an even CHAOS_NODES
+//! asymmetric quorums are used either way) and CHAOS_SEED. The seed fixes the fault
 //! and client decisions, not thread timing, so a rerun is similar, not
 //! identical. The data directory (raft state keyed by the random node ids
 //! printed at start, event journals, nodeN.log per member, fault timeline)
@@ -147,6 +148,7 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
         summary["nodes"] = json!(settings.nodes);
         summary["snapshot_every"] = json!(settings.snapshot_every);
         summary["snapshot_chunk"] = json!(settings.snapshot_chunk);
+        summary["asymmetric_quorum"] = json!(settings.asymmetric_quorum);
         summary["agreed_entries"] = json!(agreed);
         // Raft state is ID.json plus, in newer versions, the ID.log.jsonl log
         // and the ID.snapshot.json snapshot.
@@ -190,6 +192,7 @@ struct Settings {
     max_down: usize,
     snapshot_every: usize,
     snapshot_chunk: usize,
+    asymmetric_quorum: bool,
     seed: u64,
     keep: bool,
 }
@@ -206,6 +209,7 @@ impl Settings {
             max_down: env_or("CHAOS_MAX_DOWN", ((nodes - 1) / 2) as usize),
             snapshot_every: env_or("CHAOS_SNAPSHOT_EVERY", 500),
             snapshot_chunk: env_or("CHAOS_SNAPSHOT_CHUNK", 4096),
+            asymmetric_quorum: env_or("CHAOS_ASYMMETRIC", 0u8) != 0,
             seed: env_or("CHAOS_SEED", clock % 1_000_000_000),
             keep: env_or("CHAOS_KEEP", 0u8) != 0,
         }
@@ -348,6 +352,7 @@ struct Cluster {
     unexpected_exits: Vec<String>,
     snapshot_every: usize,
     snapshot_chunk: usize,
+    asymmetric_quorum: bool,
 }
 
 impl Cluster {
@@ -377,6 +382,7 @@ impl Cluster {
             unexpected_exits: Vec::new(),
             snapshot_every: settings.snapshot_every,
             snapshot_chunk: settings.snapshot_chunk,
+            asymmetric_quorum: settings.asymmetric_quorum,
         };
         for index in 0..cluster.members.len() {
             cluster.spawn(index);
@@ -406,6 +412,9 @@ impl Cluster {
             .arg(self.snapshot_every.to_string())
             .arg("--snapshot-chunk")
             .arg(self.snapshot_chunk.to_string());
+        if self.asymmetric_quorum {
+            command.arg("--asymmetric-quorum");
+        }
         for peer in self.members.iter().filter(|m| m.n != member.n) {
             command.arg("--peer").arg(&peer.addr);
         }

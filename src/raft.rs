@@ -1,15 +1,24 @@
 //! A single-Raft-group key-value store.
 //!
-//! The cluster elects one leader and replicates a command log to a majority
-//! before a write is applied or acknowledged. A member that cannot reach a
-//! majority refuses the client call, so a partition can serve from at most one
-//! side. That is the same consistency/partition choice etcd makes.
+//! The cluster elects one leader and replicates a command log to a commit
+//! quorum before a write is applied or acknowledged. A member that cannot
+//! reach a quorum refuses the client call, so a partition can serve from at
+//! most one side. That is the same consistency/partition choice etcd makes.
+//!
+//! Election and commit quorums may differ in size, as long as every election
+//! quorum overlaps every commit quorum and every other election quorum
+//! (Flexible Paxos). With an even number of voters the commit quorum is half
+//! of them and elections take a majority; with an odd number both are a
+//! majority unless the cluster opted in to asymmetric quorums (see
+//! `Membership::quorum`).
 //!
 //! Membership is stored in the log as `Command::Config` entries and changes
 //! one server at a time (Raft thesis §4.1). Every server uses the latest
 //! configuration in its log, committed or not, and falls back to the previous
-//! one if that entry is truncated. A new server joins as a learner that
-//! receives the log without voting, and is promoted once it has caught up.
+//! one if that entry is truncated. Until the latest commits, quorums are
+//! needed in it and the previous one both (see `Quorums`). A new server joins
+//! as a learner that receives the log without voting, and is promoted once it
+//! has caught up.
 //! Any member but the last voter can be removed. A leader that removes itself
 //! leads until the change commits, then hands off to the most caught-up voter.
 //!
@@ -66,12 +75,107 @@ pub struct Config {
     pub snapshot_every: usize,
     /// Most bytes of a snapshot sent to a follower in one request.
     pub snapshot_chunk: usize,
+    /// Opt in to asymmetric quorums with an odd number of voters. With an
+    /// even number they are always used. Ignored when joining: a joining
+    /// member takes the cluster's setting from the log.
+    pub asymmetric_quorum: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Membership {
     voters: Vec<Peer>,
     learners: Vec<Peer>,
+    /// Use asymmetric quorums with an odd number of voters too (see
+    /// `Membership::quorum`). Set at bootstrap and carried by every later
+    /// configuration, so all members agree on it.
+    asymmetric_quorum: bool,
+}
+
+/// What a quorum of voters is gathered for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuorumKind {
+    /// Votes (and prevotes) to win an election.
+    Election,
+    /// Acknowledgements to commit an entry, or to confirm leadership.
+    Commit,
+}
+
+impl Membership {
+    /// Voters needed for `kind`. Safety only needs every election quorum to
+    /// overlap every other election quorum and every commit quorum
+    /// (Flexible Paxos), so with N voters a commit quorum of N/2 (rounded
+    /// down) pairs with an election quorum of N - N/2 + 1. With an even N
+    /// the election quorum is the usual majority and only the commit quorum
+    /// shrinks, so it is always used. With an odd N it costs one more vote
+    /// to elect, so it is used only when the cluster opted in.
+    fn quorum(&self, kind: QuorumKind) -> usize {
+        let voters = self.voters.len();
+        if voters == 0 {
+            return 1;
+        }
+        if voters % 2 == 1 && !self.asymmetric_quorum {
+            return voters / 2 + 1;
+        }
+        let commit = (voters / 2).max(1);
+        match kind {
+            QuorumKind::Commit => commit,
+            QuorumKind::Election => voters + 1 - commit,
+        }
+    }
+
+    /// Whether the voters for which `granted` holds make a quorum.
+    fn has_quorum(&self, kind: QuorumKind, granted: impl Fn(u64) -> bool) -> bool {
+        let count = self.voters.iter().filter(|peer| granted(peer.id)).count();
+        count >= self.quorum(kind)
+    }
+
+    fn voters_differ(&self, other: &Membership) -> bool {
+        self.voters != other.voters || self.asymmetric_quorum != other.asymmetric_quorum
+    }
+}
+
+/// The configurations a quorum must be gathered in. Until the latest
+/// configuration commits, members that have not received it still use the
+/// one before, so a quorum is needed in each (joint consensus, Raft thesis
+/// §4.3). Majorities of configurations one server apart always overlap, but
+/// asymmetric quorums need not: going from 3 voters to 4, a commit quorum of
+/// two new-configuration voters can miss an election quorum of two old ones.
+#[derive(Clone, Debug)]
+struct Quorums {
+    current: Membership,
+    previous: Option<Membership>,
+}
+
+impl Quorums {
+    fn reached(&self, kind: QuorumKind, granted: impl Fn(u64) -> bool) -> bool {
+        joint_quorum(&self.current, self.previous.as_ref(), kind, granted)
+    }
+
+    /// Voters other than `me` in either configuration.
+    fn others(&self, me: u64) -> Vec<Peer> {
+        voters_of(&self.current, self.previous.as_ref(), me)
+    }
+}
+
+fn joint_quorum(
+    current: &Membership,
+    previous: Option<&Membership>,
+    kind: QuorumKind,
+    granted: impl Fn(u64) -> bool,
+) -> bool {
+    current.has_quorum(kind, &granted)
+        && previous.is_none_or(|previous| previous.has_quorum(kind, &granted))
+}
+
+fn voters_of(current: &Membership, previous: Option<&Membership>, me: u64) -> Vec<Peer> {
+    let mut voters: Vec<Peer> = current.voters.clone();
+    for peer in previous.into_iter().flat_map(|previous| &previous.voters) {
+        if !voters.iter().any(|voter| voter.id == peer.id) {
+            voters.push(peer.clone());
+        }
+    }
+    voters.retain(|peer| peer.id != me);
+    voters
 }
 
 impl Membership {
@@ -137,6 +241,7 @@ impl Snapshot {
             "config_index": self.config_index,
             "voters": peers_json(&self.membership.voters),
             "learners": peers_json(&self.membership.learners),
+            "asymmetric_quorum": self.membership.asymmetric_quorum,
         })
         .to_string();
         // Splice the key space in rather than copying it into a `Value`.
@@ -230,6 +335,9 @@ struct Inner {
     id: u64,
     membership: Membership,
     config_index: usize,
+    /// The configuration before the one at `config_index`; quorums need it
+    /// too until that one commits (see `Quorums`).
+    previous_membership: Membership,
     role: Role,
     current_term: u64,
     voted_for: Option<u64>,
@@ -302,7 +410,8 @@ struct Inner {
     /// sent. A round counts a busy peer once this passes the round's start.
     peer_acked: HashMap<u64, Instant>,
     data_dir: Option<PathBuf>,
-    votes: usize,
+    /// Voters that granted this candidate their vote, itself included.
+    votes: Vec<u64>,
     telemetry: Arc<Telemetry>,
 }
 
@@ -341,6 +450,7 @@ impl Node {
             Membership {
                 voters,
                 learners: Vec::new(),
+                asymmetric_quorum: config.asymmetric_quorum,
             }
         };
 
@@ -532,6 +642,12 @@ impl Node {
         self.await_commit(index, rx).await
     }
 
+    /// Whether the cluster, as this member knows it, opted in to asymmetric
+    /// quorums. Bootstrap peers compare it at startup.
+    pub(crate) async fn asymmetric_quorum(&self) -> bool {
+        self.inner.lock().await.membership.asymmetric_quorum
+    }
+
     /// Local view of the membership; not linearizable.
     pub(crate) async fn membership(&self) -> Value {
         let inner = self.inner.lock().await;
@@ -542,6 +658,9 @@ impl Node {
             "learners": peers_json(&inner.membership.learners),
             "config_index": inner.config_index,
             "committed": inner.config_index <= inner.commit_index,
+            "asymmetric_quorum": inner.membership.asymmetric_quorum,
+            "election_quorum": inner.membership.quorum(QuorumKind::Election),
+            "commit_quorum": inner.membership.quorum(QuorumKind::Commit),
         })
     }
 
@@ -638,8 +757,8 @@ impl Node {
                     leader: inner.leader_addr(),
                 });
             }
-            // One change at a time keeps every old and new majority
-            // overlapping.
+            // One change at a time keeps every quorum of the old and new
+            // configurations overlapping (see `Quorums`).
             if inner.config_index > inner.commit_index {
                 return Err(RaftError::Busy(
                     "another membership change is still committing".into(),
@@ -734,7 +853,8 @@ impl Node {
         }
     }
 
-    /// Confirm this node is still the leader with a majority, then read. A
+    /// Confirm this node is still the leader with a commit quorum, which
+    /// overlaps every election quorum, so no newer leader exists. Then read. A
     /// new leader must first commit an entry of its own term (its no-op):
     /// until then it may not know how far the old leader committed, and its
     /// applied state can trail writes that were already acknowledged.
@@ -1306,7 +1426,8 @@ impl Node {
                     "since_leader_contact_ms": inner.last_leader_contact.elapsed().as_millis(),
                 }),
             );
-            if inner.quorum() <= 1 {
+            let me = inner.id;
+            if inner.has_quorum(QuorumKind::Election, |id| id == me) {
                 inner.current_term = inner.current_term.saturating_add(1).max(1);
                 inner.voted_for = Some(inner.id);
                 if inner.save_hard_state() {
@@ -1320,15 +1441,15 @@ impl Node {
                 last_log_index: inner.last_index() as u64,
                 last_log_term: inner.last_term(),
                 peers: inner.other_voters(),
-                quorum: inner.quorum(),
+                quorums: inner.quorums(),
             }
         };
 
         if !transfer {
-            let mut grants = 1usize;
+            let mut grants = vec![campaign.candidate_id];
+            let mut outstanding: Vec<u64> = campaign.peers.iter().map(|peer| peer.id).collect();
             let mut higher_term = None;
             let mut pending = JoinSet::new();
-            let peer_count = campaign.peers.len();
             for peer in campaign.peers {
                 let req = json!({
                     "term": campaign.current_term + 1,
@@ -1338,13 +1459,22 @@ impl Node {
                     "prevote": true,
                 });
                 let this = Arc::clone(self);
-                pending
-                    .spawn(async move { this.peer_rpc(&peer, "/raft/request-vote", &req).await });
+                pending.spawn(async move {
+                    let response = this.peer_rpc(&peer, "/raft/request-vote", &req).await;
+                    (peer.id, response)
+                });
             }
-            let mut answered = 0usize;
+            let won = |grants: &[u64]| {
+                campaign
+                    .quorums
+                    .reached(QuorumKind::Election, |id| grants.contains(&id))
+            };
             while let Some(joined) = pending.join_next().await {
-                answered += 1;
-                if let Ok(Ok(response)) = joined {
+                let Ok((voter, response)) = joined else {
+                    continue;
+                };
+                outstanding.retain(|id| *id != voter);
+                if let Ok(response) = response {
                     let term = u64_field(&response, "term").unwrap_or(0);
                     if term > campaign.current_term {
                         higher_term = Some(term);
@@ -1355,11 +1485,11 @@ impl Node {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
                     {
-                        grants += 1;
+                        grants.push(voter);
                     }
                 }
-                let outstanding = peer_count - answered;
-                if grants >= campaign.quorum || grants + outstanding < campaign.quorum {
+                let possible: Vec<u64> = grants.iter().chain(&outstanding).copied().collect();
+                if won(&grants) || !won(&possible) {
                     break;
                 }
             }
@@ -1368,19 +1498,19 @@ impl Node {
                 self.inner.lock().await.observe_term(term);
                 return;
             }
-            if grants < campaign.quorum {
+            if !won(&grants) {
                 self.telemetry.prevotes_failed.inc();
                 tracing::debug!(
                     node = campaign.candidate_id,
-                    grants,
-                    quorum = campaign.quorum,
+                    grants = grants.len(),
+                    quorum = campaign.quorums.current.quorum(QuorumKind::Election),
                     "prevote failed"
                 );
                 return;
             }
             tracing::debug!(
                 node = campaign.candidate_id,
-                grants,
+                grants = grants.len(),
                 term = campaign.current_term + 1,
                 "prevote succeeded"
             );
@@ -1397,7 +1527,7 @@ impl Node {
             inner.current_term = inner.current_term.saturating_add(1);
             inner.role = Role::Candidate;
             inner.voted_for = Some(inner.id);
-            inner.votes = 1;
+            inner.votes = vec![inner.id];
             inner.leader_id = None;
             // The vote for itself must be saved before asking for others.
             if !inner.save_hard_state() {
@@ -1419,13 +1549,13 @@ impl Node {
             let req = vote_req.clone();
             tokio::spawn(async move {
                 if let Ok(response) = this.peer_rpc(&peer, "/raft/request-vote", &req).await {
-                    this.on_vote(term, response).await;
+                    this.on_vote(term, peer.id, response).await;
                 }
             });
         }
     }
 
-    async fn on_vote(self: &Arc<Self>, election_term: u64, response: Value) {
+    async fn on_vote(self: &Arc<Self>, election_term: u64, voter: u64, response: Value) {
         if !self.running.load(Ordering::Relaxed) {
             return;
         }
@@ -1446,8 +1576,10 @@ impl Node {
             if !granted {
                 return;
             }
-            inner.votes += 1;
-            if inner.votes >= inner.quorum() {
+            if !inner.votes.contains(&voter) {
+                inner.votes.push(voter);
+            }
+            if inner.has_quorum(QuorumKind::Election, |id| inner.votes.contains(&id)) {
                 inner.become_leader();
                 true
             } else {
@@ -1463,20 +1595,18 @@ impl Node {
         if !self.running.load(Ordering::Relaxed) {
             return false;
         }
-        let (voters, learners, quorum, term, self_vote) = {
+        let (voters, learners, quorums, term, me) = {
             let mut inner = self.inner.lock().await;
             if inner.role != Role::Leader {
                 return false;
             }
+            let quorums = inner.quorums();
+            let voters = quorums.others(inner.id);
             let mut learners = inner.other_learners();
             learners.extend(inner.departing_peers());
-            (
-                inner.other_voters(),
-                learners,
-                inner.quorum(),
-                inner.current_term,
-                usize::from(inner.is_voter()),
-            )
+            // A removed voter still counts until its removal commits.
+            learners.retain(|learner| !voters.iter().any(|voter| voter.id == learner.id));
+            (voters, learners, quorums, inner.current_term, inner.id)
         };
 
         // Learners and departing members never count toward quorum, so they
@@ -1491,17 +1621,19 @@ impl Node {
         let mut pending = JoinSet::new();
         for peer in voters {
             let this = Arc::clone(self);
-            pending.spawn(async move { this.confirm(peer, started, deadline).await });
+            pending.spawn(async move { (peer.id, this.confirm(peer, started, deadline).await) });
         }
-        let mut ok = self_vote;
-        while ok < quorum {
+        let mut acked = vec![me];
+        let reached = |acked: &[u64]| quorums.reached(QuorumKind::Commit, |id| acked.contains(&id));
+        while !reached(&acked) {
             let Some(joined) = pending.join_next().await else {
                 break;
             };
-            if matches!(joined, Ok(RpcOutcome::CaughtUp | RpcOutcome::Acked)) {
-                ok += 1;
+            if let Ok((id, RpcOutcome::CaughtUp | RpcOutcome::Acked)) = joined {
+                acked.push(id);
             }
         }
+        let ok = reached(&acked);
         // Let the slower voters finish rather than cancelling them: up-to-date
         // followers answer within a millisecond, so a follower that is catching
         // up would otherwise be cancelled mid-RPC every round and never
@@ -1509,7 +1641,7 @@ impl Node {
         // at most one round per peer outlives this call.
         pending.detach_all();
         let mut inner = self.inner.lock().await;
-        if inner.role == Role::Leader && inner.current_term == term && ok >= quorum {
+        if inner.role == Role::Leader && inner.current_term == term && ok {
             inner.last_quorum_ok = Instant::now();
             inner.advance_commit();
             true
@@ -1809,7 +1941,7 @@ struct Campaign {
     last_log_index: u64,
     last_log_term: u64,
     peers: Vec<Peer>,
-    quorum: usize,
+    quorums: Quorums,
 }
 
 impl Inner {
@@ -1826,6 +1958,7 @@ impl Inner {
         Self {
             id,
             membership: bootstrap.clone(),
+            previous_membership: bootstrap.clone(),
             base_membership: (0, bootstrap),
             config_index: 0,
             role: Role::Follower,
@@ -1869,7 +2002,7 @@ impl Inner {
             last_quorum_ok: now,
             peer_acked: HashMap::new(),
             data_dir,
-            votes: 0,
+            votes: Vec::new(),
             telemetry,
         }
     }
@@ -1934,8 +2067,22 @@ impl Inner {
         self.election_deadline = now + self.election_timeout;
     }
 
-    fn quorum(&self) -> usize {
-        self.membership.voters.len() / 2 + 1
+    /// The previous configuration, while the latest has not committed.
+    fn joint_with(&self) -> Option<&Membership> {
+        (self.config_index > self.commit_index
+            && self.previous_membership.voters_differ(&self.membership))
+        .then_some(&self.previous_membership)
+    }
+
+    fn quorums(&self) -> Quorums {
+        Quorums {
+            current: self.membership.clone(),
+            previous: self.joint_with().cloned(),
+        }
+    }
+
+    fn has_quorum(&self, kind: QuorumKind, granted: impl Fn(u64) -> bool) -> bool {
+        joint_quorum(&self.membership, self.joint_with(), kind, granted)
     }
 
     fn is_voter(&self) -> bool {
@@ -2023,6 +2170,11 @@ impl Inner {
                     .event("removed_from_cluster", json!({ "index": index }));
             }
         }
+        self.previous_membership = if index > self.log_base {
+            self.membership_at(index - 1).1
+        } else {
+            membership.clone()
+        };
         self.membership = membership;
         self.config_index = index;
         // A member re-added, or a removal truncated away, is not departing.
@@ -2067,13 +2219,10 @@ impl Inner {
         self.log.get(slot).map(|entry| entry.term)
     }
 
+    /// Voters other than this one, in the latest configuration and, until
+    /// it commits, the one before.
     fn other_voters(&self) -> Vec<Peer> {
-        self.membership
-            .voters
-            .iter()
-            .filter(|peer| peer.id != self.id)
-            .cloned()
-            .collect()
+        voters_of(&self.membership, self.joint_with(), self.id)
     }
 
     fn other_learners(&self) -> Vec<Peer> {
@@ -2164,7 +2313,7 @@ impl Inner {
         }
         self.role = Role::Follower;
         self.leader_id = None;
-        self.votes = 0;
+        self.votes.clear();
         self.transferring = false;
         self.election_timeout = random_timeout(self.id);
         self.election_deadline = Instant::now() + self.election_timeout;
@@ -2199,7 +2348,7 @@ impl Inner {
         self.voted_for = None;
         self.role = Role::Follower;
         self.leader_id = None;
-        self.votes = 0;
+        self.votes.clear();
         self.election_in_progress = false;
         self.transferring = false;
         self.election_timeout = random_timeout(self.id);
@@ -2242,15 +2391,14 @@ impl Inner {
             }
             // The leader's own copy counts once it is on disk; it writes in
             // parallel with replication (Raft thesis §10.2.1).
-            let mut replicas = usize::from(self.is_voter() && self.synced >= index);
-            for voter in &self.membership.voters {
-                if voter.id != self.id
-                    && self.match_index.get(&voter.id).is_some_and(|m| *m >= index)
-                {
-                    replicas += 1;
+            let replicated = |id: u64| {
+                if id == self.id {
+                    self.synced >= index
+                } else {
+                    self.match_index.get(&id).is_some_and(|m| *m >= index)
                 }
-            }
-            if replicas >= self.quorum() {
+            };
+            if self.has_quorum(QuorumKind::Commit, replicated) {
                 commit = index;
             }
         }
@@ -2896,7 +3044,8 @@ fn entry_json(entry: &Entry) -> Value {
             "term": entry.term,
             "op": "config",
             "voters": peers_json(&membership.voters),
-            "learners": peers_json(&membership.learners)
+            "learners": peers_json(&membership.learners),
+            "asymmetric_quorum": membership.asymmetric_quorum
         }),
     }
 }
@@ -2906,6 +3055,19 @@ fn peers_json(peers: &[Peer]) -> Value {
         .iter()
         .map(|peer| json!({ "id": peer.id, "addr": peer.addr }))
         .collect()
+}
+
+/// A configuration from a log entry or snapshot. Those written before
+/// asymmetric quorums existed lack the flag, and used majorities.
+fn parse_membership(value: &Value) -> Option<Membership> {
+    Some(Membership {
+        voters: parse_peers(value.get("voters")?)?,
+        learners: parse_peers(value.get("learners")?)?,
+        asymmetric_quorum: value
+            .get("asymmetric_quorum")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
 }
 
 fn parse_peers(value: &Value) -> Option<Vec<Peer>> {
@@ -3005,10 +3167,7 @@ fn parse_snapshot(value: &Value) -> Option<Snapshot> {
         index: u64_field(value, "index")? as usize,
         term: u64_field(value, "term")?,
         config_index: u64_field(value, "config_index")? as usize,
-        membership: Membership {
-            voters: parse_peers(value.get("voters")?)?,
-            learners: parse_peers(value.get("learners")?)?,
-        },
+        membership: parse_membership(value)?,
         data: value
             .get("data")?
             .as_object()?
@@ -3030,10 +3189,7 @@ fn parse_entry(value: &Value) -> Option<Entry> {
         "del" => Command::Delete {
             key: value.get("key")?.as_str()?.to_string(),
         },
-        "config" => Command::Config(Membership {
-            voters: parse_peers(value.get("voters")?)?,
-            learners: parse_peers(value.get("learners")?)?,
-        }),
+        "config" => Command::Config(parse_membership(value)?),
         _ => return None,
     };
     Some(Entry { term, command })
@@ -3063,6 +3219,7 @@ mod tests {
             membership: Membership {
                 voters: vec![Peer { id: 1, addr: "127.0.0.1:1".into() }],
                 learners: vec![Peer { id: 2, addr: "127.0.0.1:2".into() }],
+                asymmetric_quorum: true,
             },
             data,
         };
@@ -3073,5 +3230,109 @@ mod tests {
         assert_eq!(parsed.config_index, 3);
         assert_eq!(parsed.membership, snapshot.membership);
         assert_eq!(parsed.data, snapshot.data);
+    }
+
+    fn members(ids: &[u64], asymmetric_quorum: bool) -> Membership {
+        Membership {
+            voters: ids
+                .iter()
+                .map(|id| Peer { id: *id, addr: format!("127.0.0.1:{id}") })
+                .collect(),
+            learners: Vec::new(),
+            asymmetric_quorum,
+        }
+    }
+
+    fn sizes(voters: u64, asymmetric_quorum: bool) -> (usize, usize) {
+        let ids: Vec<u64> = (1..=voters).collect();
+        let membership = members(&ids, asymmetric_quorum);
+        (
+            membership.quorum(QuorumKind::Election),
+            membership.quorum(QuorumKind::Commit),
+        )
+    }
+
+    #[test]
+    fn quorum_sizes() {
+        // (election, commit) by voter count, without and with the opt-in.
+        let expected = [
+            (1, (1, 1), (1, 1)),
+            (2, (2, 1), (2, 1)),
+            (3, (2, 2), (3, 1)),
+            (4, (3, 2), (3, 2)),
+            (5, (3, 3), (4, 2)),
+            (6, (4, 3), (4, 3)),
+        ];
+        for (voters, symmetric, asymmetric) in expected {
+            assert_eq!(sizes(voters, false), symmetric, "{voters} voters");
+            assert_eq!(sizes(voters, true), asymmetric, "{voters} voters, opted in");
+        }
+    }
+
+    /// Two leaders cannot be elected in one term, and a new leader holds
+    /// every committed entry, only if election quorums overlap each other
+    /// and every commit quorum.
+    #[test]
+    fn quorums_overlap() {
+        for voters in 1..=12 {
+            for asymmetric in [false, true] {
+                let (election, commit) = sizes(voters, asymmetric);
+                let voters = voters as usize;
+                assert!(commit >= 1 && election <= voters, "{voters} {asymmetric}");
+                assert!(election + commit > voters, "{voters} {asymmetric}");
+                assert!(2 * election > voters, "{voters} {asymmetric}");
+            }
+        }
+    }
+
+    #[test]
+    fn uncommitted_configuration_needs_both_quorums() {
+        // Going from {1, 2, 3} to {1, 2, 3, 4}: two voters commit under the
+        // new configuration, but 1 and 2, still on the old one, could elect a
+        // leader without 3 or 4. Until the change commits, 3 and 4 are not
+        // enough.
+        let quorums = Quorums {
+            current: members(&[1, 2, 3, 4], false),
+            previous: Some(members(&[1, 2, 3], false)),
+        };
+        let of = |ids: &'static [u64]| move |id| ids.contains(&id);
+        assert!(!quorums.reached(QuorumKind::Commit, of(&[3, 4])));
+        assert!(quorums.reached(QuorumKind::Commit, of(&[2, 3])));
+        assert!(!quorums.reached(QuorumKind::Election, of(&[1, 4])));
+        assert!(quorums.reached(QuorumKind::Election, of(&[2, 3, 4])));
+        let mut others: Vec<u64> = quorums.others(1).iter().map(|peer| peer.id).collect();
+        others.sort_unstable();
+        assert_eq!(others, vec![2, 3, 4]);
+
+        // Removing 5 of five: the departing voter counts toward the old
+        // configuration until the change commits.
+        let quorums = Quorums {
+            current: members(&[1, 2, 3, 4], false),
+            previous: Some(members(&[1, 2, 3, 4, 5], false)),
+        };
+        assert!(!quorums.reached(QuorumKind::Commit, of(&[1, 2])));
+        assert!(quorums.reached(QuorumKind::Commit, of(&[1, 2, 5])));
+        assert!(quorums.reached(QuorumKind::Commit, of(&[1, 2, 3])));
+    }
+
+    #[test]
+    fn config_entry_round_trips_the_quorum_setting() {
+        for asymmetric in [false, true] {
+            let entry = Entry {
+                term: 3,
+                command: Command::Config(members(&[1, 2, 3], asymmetric)),
+            };
+            let parsed = parse_entry(&entry_json(&entry)).unwrap();
+            let Command::Config(membership) = parsed.command else {
+                panic!("not a config entry");
+            };
+            assert_eq!(membership.asymmetric_quorum, asymmetric);
+        }
+        // Entries written before the setting existed used majorities.
+        let old = json!({"term": 1, "op": "config", "voters": [], "learners": []});
+        let Command::Config(membership) = parse_entry(&old).unwrap().command else {
+            panic!("not a config entry");
+        };
+        assert!(!membership.asymmetric_quorum);
     }
 }

@@ -1,6 +1,6 @@
 //! Client HTTP API. Any member accepts a call: followers forward to the
 //! current leader, and the leader answers only after Raft has committed the
-//! write or confirmed it still holds a majority.
+//! write or confirmed it still holds a quorum.
 
 use crate::net;
 use crate::raft::{Command, Node, Peer, RaftError};
@@ -48,7 +48,7 @@ pub fn router(node: Arc<Node>) -> Router {
 
 /// Lets a starting member learn this member's id from its address.
 async fn node_id(State(node): State<Arc<Node>>) -> Json<Value> {
-    Json(json!({ "id": node.id() }))
+    Json(json!({ "id": node.id(), "asymmetric_quorum": node.asymmetric_quorum().await }))
 }
 
 /// Count and time client requests. Requests forwarded by another member are

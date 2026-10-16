@@ -33,6 +33,7 @@ fn parse_args() -> Result<Options, String> {
     let mut join = None;
     let mut snapshot_every = DEFAULT_SNAPSHOT_EVERY;
     let mut snapshot_chunk = DEFAULT_SNAPSHOT_CHUNK;
+    let mut asymmetric_quorum = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -85,11 +86,18 @@ fn parse_args() -> Result<Options, String> {
                     .filter(|n| *n > 0)
                     .ok_or_else(|| "--snapshot-chunk needs a positive number of bytes".to_string())?;
             }
+            "--asymmetric-quorum" => asymmetric_quorum = true,
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
     }
     if join.is_some() && !peers.is_empty() {
         return Err("--join and --peer cannot be combined".to_string());
+    }
+    if join.is_some() && asymmetric_quorum {
+        return Err(
+            "--asymmetric-quorum is set when a cluster is created; a joining member takes the cluster's setting"
+                .to_string(),
+        );
     }
     Ok(Options {
         listen,
@@ -98,12 +106,13 @@ fn parse_args() -> Result<Options, String> {
         join,
         snapshot_every,
         snapshot_chunk,
+        asymmetric_quorum,
     })
 }
 
 fn usage() -> &'static str {
     "usage: key-value-store [--listen ADDR] [--peer ADDR]... [--join ADDR] [--data-dir PATH]\n\
-                       [--snapshot-every N] [--snapshot-chunk BYTES]\n\
+                       [--snapshot-every N] [--snapshot-chunk BYTES] [--asymmetric-quorum]\n\
      \n\
      One process is one member of a Raft cluster. To bootstrap a cluster, pass\n\
      every initial member, including this one, via --peer. With no --peer flags\n\
@@ -119,9 +128,17 @@ fn usage() -> &'static str {
      --listen must be an address the other members can reach. After the first\n\
      membership change, the log, not --peer, defines the cluster.\n\
      \n\
+     Quorums: with an even number of voters N, a write commits once N/2\n\
+     voters have it, while an election still needs N/2+1 votes. With an odd\n\
+     N, both are a majority unless --asymmetric-quorum is given when the\n\
+     cluster is created: then writes need (N-1)/2 voters and elections\n\
+     (N+3)/2, trading election availability for write availability and\n\
+     latency. Every initial member must get the same setting; joining\n\
+     members inherit it. GET /cluster/members shows the quorum sizes.\n\
+     \n\
      GET    /{key}   200 and the JSON object, or 404\n\
-     PUT    /{key}   JSON object body, 201 once a majority commits it\n\
-     DELETE /{key}   204 once a majority commits the delete\n\
+     PUT    /{key}   JSON object body, 201 once a commit quorum holds it\n\
+     DELETE /{key}   204 once a commit quorum holds the delete\n\
      \n\
      GET    /cluster/id        {\"id\": N} for this member\n\
      GET    /cluster/members   this member's view of voters and learners\n\
@@ -138,7 +155,7 @@ fn usage() -> &'static str {
      cut short resumes from the last chunk the member received.\n\
      \n\
      With --data-dir, state survives power loss, not just a crash: a write is\n\
-     acknowledged only once a majority has fsynced it, and the term and vote\n\
+     acknowledged only once a commit quorum has fsynced it, and the term and vote\n\
      are fsynced before a member votes. Concurrent writes share an fsync\n\
      (group commit), so throughput holds up while each write waits about\n\
      one disk flush.\n\
@@ -146,7 +163,7 @@ fn usage() -> &'static str {
      With --data-dir, events and a stats snapshot every minute are also\n\
      appended to DATA_DIR/ID.events.jsonl for analysis over time.\n\
      \n\
-     Followers forward to the leader. A member that cannot reach a majority\n\
+     Followers forward to the leader. A member that cannot reach a quorum\n\
      returns 503, so a partition does not create two successful writers.\n\
      \n\
      Diagnostics go to stderr. RUST_LOG selects the level, for example\n\

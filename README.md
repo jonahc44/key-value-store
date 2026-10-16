@@ -4,7 +4,7 @@ A Raft-replicated key-value store in Rust. This guide covers how to build, run a
 
 ## Overview
 
-The system is a single Rust binary, `key-value-store`; each process is one member of a Raft cluster that serves JSON values over HTTP. Writes are acknowledged once a majority commits (and, with `--data-dir`, fsyncs) them; followers forward client requests to the leader.
+The system is a single Rust binary, `key-value-store`; each process is one member of a Raft cluster that serves JSON values over HTTP. Writes are acknowledged once a commit quorum of voters holds (and, with `--data-dir`, fsyncs) them; followers forward client requests to the leader. See [Quorums](#quorums) for the quorum sizes.
 
 | Path | What it holds |
 | --- | --- |
@@ -62,6 +62,7 @@ $B --listen 127.0.0.1:27004 --join 127.0.0.1:27001 --data-dir data > node4.log 2
 | `--data-dir PATH` | none (in-memory) | Persist identity, log, term/vote, snapshots and events; survives power loss |
 | `--snapshot-every N` | 8192 | Applied entries between snapshots; 0 never compacts |
 | `--snapshot-chunk BYTES` | 1048576 | Max bytes per snapshot transfer request |
+| `--asymmetric-quorum` | off | With an odd number of voters, use asymmetric quorums too (see [Quorums](#quorums)). Give it to every initial member or none; not allowed with `--join` |
 
 The removed `--id` flag is rejected: node ids are random and logged at start. Set the log level with `RUST_LOG`, e.g. `RUST_LOG=key_value_store=debug`; logs go to stderr.
 
@@ -71,6 +72,27 @@ Files in `--data-dir`, per member:
 - `ID.json`, `ID.commit.json`, `ID.log.jsonl` — Raft term/vote, commit index and log
 - `ID.snapshot.json` — the latest snapshot, once compaction has run
 - `ID.events.jsonl` — event journal plus a stats line every minute
+
+## Quorums
+
+A Raft cluster gathers two kinds of quorum: an **election quorum** of votes to elect a leader, and a **commit quorum** of voters that hold an entry before it commits. Safety needs only that every election quorum overlaps every commit quorum and every other election quorum, so the two can differ in size. Here the commit quorum is the smaller one:
+
+| Voters | Default (election / commit) | With `--asymmetric-quorum` |
+| --- | --- | --- |
+| 1 | 1 / 1 | 1 / 1 |
+| 2 | 2 / 1 | 2 / 1 |
+| 3 | 2 / 2 | 3 / 1 |
+| 4 | 3 / 2 | 3 / 2 |
+| 5 | 3 / 3 | 4 / 2 |
+| N even | N/2+1 / N/2 | same |
+| N odd | (N+1)/2 / (N+1)/2 | (N+3)/2 / (N-1)/2 |
+
+- **Even N** always uses asymmetric quorums. Elections still need a majority, but a leader keeps committing with half the voters, so a 4-node cluster writes with two members up where a majority would need three. The cost is that an acknowledged write may be on only N/2 disks.
+- **Odd N** uses majorities unless the cluster is created with `--asymmetric-quorum`. Then the leader commits with one voter fewer, which lowers write latency and survives more follower failures, but an election needs one more vote. For example, with 3 voters the leader alone commits, and losing any member means no new leader can be elected until it returns.
+- **Agreement.** The setting is stored in the replicated membership, so members that join later inherit it. Initial members check at startup that they agree and refuse to start otherwise. A member also refuses to restart with a different setting than its saved identity.
+- **Membership changes.** While a configuration change is uncommitted, elections and commits need a quorum in both the old and the new configuration (joint consensus, applied implicitly). With majorities, configurations one server apart always overlap, but asymmetric quorums need not.
+
+`GET /cluster/members` reports `election_quorum`, `commit_quorum` and `asymmetric_quorum` for the configuration a member is using.
 
 ## Using the store
 
@@ -87,16 +109,16 @@ curl -i -X PUT -d '42' localhost:27001/x                       # 400 body must b
 | Endpoint | Returns |
 | --- | --- |
 | `GET /{key}` | 200 with the object, or 404 |
-| `PUT /{key}` | 201 once a majority commits; 400 for a non-object body |
-| `DELETE /{key}` | 204 once a majority commits |
+| `PUT /{key}` | 201 once a commit quorum holds it; 400 for a non-object body |
+| `DELETE /{key}` | 204 once a commit quorum holds it |
 | `GET /cluster/id` | `{"id": N}` for this member |
-| `GET /cluster/members` | Leader, voters and learners as this member sees them |
+| `GET /cluster/members` | Leader, voters, learners and quorum sizes as this member sees them |
 | `POST /cluster/members` | Add a member: body `{"id": N, "addr": "HOST:PORT"}` (`--join` does this for you) |
 | `DELETE /cluster/members/{id}` | Remove a member, including the leader itself |
 | `GET /cluster/metrics` | Prometheus text: role, term, leader, key count, request counters |
 | `GET /cluster/events` | Recent events as JSON: elections, leader changes, peers dropping out |
 
-Any request may return 503 when the member cannot reach a majority; that is the intended behavior during a partition, not a bug. To find the leader quickly:
+Any request may return 503 when the member cannot reach a quorum; that is the intended behavior during a partition, not a bug. To find the leader quickly:
 
 ```bash
 curl -s localhost:27001/cluster/members | python3 -m json.tool
@@ -104,7 +126,7 @@ curl -s localhost:27001/cluster/members | python3 -m json.tool
 
 ## Testing
 
-`cargo test --release` runs the default suite: 23 tests, which take about 6 seconds. Two long-running tests are marked `#[ignore]` and run only on request.
+`cargo test --release` runs the default suite: 33 tests, which take about 6 seconds. Two long-running tests are marked `#[ignore]` and run only on request.
 
 ```bash
 cargo test --release                               # default suite
@@ -116,9 +138,9 @@ RUST_LOG=key_value_store=debug cargo test --release <name> -- --nocapture   # wi
 | Suite | Location | Covers |
 | --- | --- | --- |
 | Key space | `src/keyspace.rs` | Copy-on-write clones, shard-level copying |
-| Identity | `src/identity.rs` | Random ids, peer id discovery, identity reuse on restart |
-| Raft internals | `src/raft.rs` | Snapshot text round-trip, chunked snapshot resume |
-| Cluster integration | `src/lib.rs` | Put/get/delete, forwarding, minority writes refused, restart from `--data-dir`, torn log lines, joins and removals, leader hand-off, compaction, snapshot catch-up, group commit |
+| Identity | `src/identity.rs` | Random ids, peer id discovery, quorum setting agreement, identity reuse on restart |
+| Raft internals | `src/raft.rs` | Snapshot text round-trip, chunked snapshot resume, quorum sizes and overlap, joint quorums during membership changes |
+| Cluster integration | `src/lib.rs` | Put/get/delete, forwarding, minority writes refused, restart from `--data-dir`, torn log lines, joins and removals, leader hand-off, compaction, snapshot catch-up, group commit, asymmetric quorums for even and opted-in odd clusters |
 | Chaos (ignored) | `tests/chaos.rs` | Real multi-process cluster under random SIGKILL/SIGSTOP |
 | Snapshot stall (ignored) | `src/lib.rs` | Benchmark: hundreds of thousands of entries while snapshotting |
 
@@ -141,6 +163,7 @@ A 10-second run typically injects around ten faults and verifies over a thousand
 | `CHAOS_MAX_DOWN` | (nodes-1)/2 | Members out at once; higher allows full outages |
 | `CHAOS_SNAPSHOT_EVERY` | 500 | Low so compaction happens under faults |
 | `CHAOS_SNAPSHOT_CHUNK` | 4096 | Small so kills land mid-transfer |
+| `CHAOS_ASYMMETRIC` | 0 | 1 starts members with `--asymmetric-quorum` |
 | `CHAOS_SEED` | from clock | Reproduces fault and client decisions (not thread timing) |
 | `CHAOS_KEEP` | 0 | 1 keeps the data dir; it is always kept on failure |
 | `CHAOS_SUMMARY` / `CHAOS_LABEL` | unset | Append a JSON summary line to a file, tagged with a label |
@@ -161,7 +184,7 @@ cargo test --release --lib snapshot_stall -- --ignored --nocapture
 Use the three-node cluster from [Running the system](#running-the-system), with `--data-dir`.
 
 1. **Kill the leader.** Find it with `GET /cluster/members` (`leader` is an id; match it to `voters[].addr`), then `kill -9` its process. A survivor elects a new leader and `PUT` succeeds again within seconds.
-2. **Lose the majority.** Kill a second member. The last one returns `503 {"error":"leader unreachable"}` for both reads and writes rather than serving stale data.
+2. **Lose the quorum.** Kill a second member. The last one returns `503 {"error":"leader unreachable"}` for both reads and writes rather than serving stale data.
 3. **Restart from disk.** Start the killed members again with the same `--listen`, `--peer` and `--data-dir` flags. They reuse their saved ids, rejoin, and every member returns the last acknowledged value.
 4. **Freeze instead of kill.** `kill -STOP <pid>` then `kill -CONT <pid>` simulates a long pause; the others elect a new leader, and the resumed member rejoins as a follower.
 5. **Exercise snapshots.** Start with `--snapshot-every 100 --snapshot-chunk 4096`, write a few hundred keys while one member is down, then restart it. It catches up by chunked snapshot; `ID.snapshot.json` appears in the data dir.
@@ -175,9 +198,11 @@ Watch `GET /cluster/events` on any member to see the elections, leader changes a
 | --- | --- |
 | `unknown argument --peer A --peer B ...` | Your shell passed the whole peer list as one argument. zsh does not split `$PEERS`; run the script with bash or write the flags out |
 | `--id was removed` | Ids are random now. Drop `--id`, and use `--peer HOST:PORT` without `N=` |
+| `peer ... disagrees on --asymmetric-quorum` | Initial members were started with different settings. Start them all with the same one |
+| `created with asymmetric quorums ...; it cannot be changed on restart` | Restart the member with the setting it was created with |
 | `--join and --peer cannot be combined` | Use `--peer` only to bootstrap; use `--join` only to add to a running cluster |
 | `/cluster/members` shows `"leader": null` and empty voters | Bootstrap members are still waiting for a peer that is not up yet. Start all of them |
-| `503 no leader` or `leader unreachable` | No majority is reachable. Bring members back; this is expected during outages |
+| `503 no leader` or `leader unreachable` | No quorum is reachable. Bring members back; this is expected during outages |
 | A restarted node gets a new id | It was started with a different `--listen` or `--data-dir`. Identity is keyed by both |
 | `Address already in use` | A previous run is still alive: `pkill -f key-value-store` |
 | Strange state after changing the cluster layout | Old files in `--data-dir` define membership after the first change. Delete the directory for a clean start |
