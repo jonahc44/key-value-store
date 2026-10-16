@@ -124,7 +124,7 @@ RUST_LOG=key_value_store=debug cargo test --release <name> -- --nocapture   # wi
 
 ### Chaos test
 
-The chaos test runs five real processes while a fault injector kills and freezes members, biased toward the leader, and eight clients write in bursts. After healing, it checks that every acknowledged write is readable, no read went backwards, all members converge, persisted logs agree, and no term had two leaders.
+The chaos test runs five real processes while a fault injector kills and freezes members, biased toward the leader, and eight clients write in bursts. The membership also changes at runtime: on any tick a new member may join with `--join`, or a voter (often the leader) may be removed with `DELETE /cluster/members/{id}` and stopped, keeping the member count between `CHAOS_MIN_NODES` and `CHAOS_MAX_NODES`. After healing, it checks that every acknowledged write is readable, no read went backwards, the configuration holds exactly the current members as voters, all members converge, persisted logs agree (removed members' up to their own commit index), and no term had two leaders.
 
 ```bash
 cargo test --release --test chaos -- --ignored --nocapture             # 30 s default
@@ -136,9 +136,12 @@ A 10-second run typically injects around ten faults and verifies over a thousand
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `CHAOS_SECS` | 30 | Run length in seconds |
-| `CHAOS_NODES` | 5 | Cluster size |
+| `CHAOS_NODES` | 5 | Starting cluster size |
+| `CHAOS_MIN_NODES` | 3 | Fewest members removals may leave |
+| `CHAOS_MAX_NODES` | nodes+2 | Most members joins may reach |
+| `CHAOS_MEMBERSHIP_CHANCE` | 0.01 | Chance per 20 ms tick of a join or removal; 0 keeps membership fixed |
 | `CHAOS_CLIENTS` | 8 | Concurrent writers |
-| `CHAOS_MAX_DOWN` | (nodes-1)/2 | Members out at once; higher allows full outages |
+| `CHAOS_MAX_DOWN` | (voters-1)/2 | Members out at once; higher allows full outages |
 | `CHAOS_SNAPSHOT_EVERY` | 500 | Low so compaction happens under faults |
 | `CHAOS_SNAPSHOT_CHUNK` | 4096 | Small so kills land mid-transfer |
 | `CHAOS_SEED` | from clock | Reproduces fault and client decisions (not thread timing) |

@@ -2,24 +2,36 @@
 //! fault injector kills (SIGKILL) and freezes (SIGSTOP) random members at
 //! random, frequent intervals, targeting the leader more often than chance,
 //! and brings them back from their data directory after a random outage.
-//! Concurrent clients meanwhile write in sporadic bursts through whichever
-//! member they pick, dead or alive, as real clients would.
+//! The membership changes too: on any tick a new member may join through
+//! `--join`, or a voter (the leader more often than chance) may be removed
+//! through `DELETE /cluster/members/{id}` and stopped once that is
+//! acknowledged, as long as the member count stays between the configured
+//! minimum and maximum. Concurrent clients meanwhile write in sporadic bursts
+//! through whichever current member they pick, dead or alive, as real clients
+//! would.
 //!
 //! Afterwards the cluster is healed and checked:
 //! - every acknowledged write is readable with the value that was written;
 //! - no read returned a value older than one already acknowledged;
+//! - the configuration holds exactly the current members, all as voters, so
+//!   every join completed and no acknowledged removal was undone;
 //! - all members converge on the same applied state;
 //! - all members' persisted logs agree up to the lowest commit index, where
-//!   both still hold the entries (a compacted prefix is not compared);
+//!   both still hold the entries (a compacted prefix is not compared), and
+//!   removed members' logs agree up to their own commit index;
 //! - no term ever had two leaders.
 //!
 //! It runs for a while, so it is ignored by default:
 //!
 //!     cargo test --release --test chaos -- --ignored --nocapture
 //!
-//! Environment knobs: CHAOS_SECS (default 30), CHAOS_NODES (5), CHAOS_CLIENTS
-//! (8), CHAOS_MAX_DOWN (members out at once; the default keeps a majority up,
-//! larger values allow full outages), CHAOS_SNAPSHOT_EVERY (500 applied entries
+//! Environment knobs: CHAOS_SECS (default 30), CHAOS_NODES (5, the starting
+//! size), CHAOS_MIN_NODES (3) and CHAOS_MAX_NODES (CHAOS_NODES + 2) bounding
+//! the size as members join and leave, CHAOS_MEMBERSHIP_CHANCE (0.01, the
+//! chance per 20 ms tick of a join or removal; 0, or equal bounds, keeps the
+//! membership fixed), CHAOS_CLIENTS (8), CHAOS_MAX_DOWN (members out at once;
+//! the default keeps a majority of the known voters up, larger values allow
+//! full outages), CHAOS_SNAPSHOT_EVERY (500 applied entries
 //! between snapshots, low so that compaction and snapshot installs happen under
 //! faults; 0 never compacts), CHAOS_SNAPSHOT_CHUNK (4096 bytes per snapshot
 //! request, small so transfers span many requests and kills land mid-transfer)
@@ -37,8 +49,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -56,6 +68,11 @@ const LEADER_BIAS: f64 = 0.35;
 const FREEZE_SHARE: f64 = 0.25;
 /// Share of outages long enough for the member to fall far behind.
 const LONG_OUTAGE_SHARE: f64 = 0.1;
+/// How often to look for joiners that have become voters.
+const OBSERVE_EVERY: Duration = Duration::from_millis(500);
+
+/// Current members' addresses, shared with the clients as members come and go.
+type Addrs = Arc<RwLock<Vec<String>>>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "runs for CHAOS_SECS (default 30 s); use --ignored"]
@@ -64,24 +81,27 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
     let dir = std::env::temp_dir().join(format!("kv-chaos-{}-{}", std::process::id(), settings.seed));
     std::fs::create_dir_all(&dir).unwrap();
     eprintln!(
-        "chaos: seed={} secs={} nodes={} clients={} max_down={} dir={}",
+        "chaos: seed={} secs={} nodes={} (min {}, max {}, change chance {}) clients={} max_down={} dir={}",
         settings.seed,
         settings.secs,
         settings.nodes,
+        settings.min_nodes,
+        settings.max_nodes,
+        settings.membership_chance,
         settings.clients,
-        settings.max_down,
+        settings.max_down.map_or("auto".to_string(), |cap| cap.to_string()),
         dir.display()
     );
 
     let mut cluster = Cluster::launch(&settings, &dir);
-    let addrs: Arc<Vec<String>> = Arc::new(cluster.members.iter().map(|m| m.addr.clone()).collect());
+    let addrs = Arc::clone(&cluster.addrs);
     cluster.learn_ids(HEAL_TIMEOUT).await;
     // A member answers /cluster/id while still discovering its peers, before
     // it serves the client API; start only once every member does.
     cluster.wait_serving(HEAL_TIMEOUT).await;
     let ids: Vec<String> = cluster.members.iter().map(|m| format!("{}={}", m.n, m.id)).collect();
     eprintln!("chaos: node ids {}", ids.join(" "));
-    if cluster.wait_writable(&addrs, HEAL_TIMEOUT).await.is_none() {
+    if cluster.wait_writable(HEAL_TIMEOUT).await.is_none() {
         cluster.stop_all().await;
         panic!("cluster never became writable; see {}", dir.display());
     }
@@ -106,17 +126,21 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
     let chaos_elapsed = cluster.started.elapsed();
 
     let mut violations: Vec<String> = logs.iter().flat_map(|log| log.violations.clone()).collect();
-    violations.extend(cluster.unexpected_exits.iter().cloned());
 
     cluster.heal().await;
+    cluster.finish_removal(HEAL_TIMEOUT).await;
+    violations.append(&mut cluster.violations);
     violations.extend(cluster.learn_ids(HEAL_TIMEOUT).await);
-    let recovery = cluster.wait_writable(&addrs, HEAL_TIMEOUT).await;
+    let recovery = cluster.wait_writable(HEAL_TIMEOUT).await;
     match recovery {
         Some(_) => {
+            if let Err(err) = cluster.wait_membership(HEAL_TIMEOUT).await {
+                violations.push(err);
+            }
             if let Err(err) = cluster.wait_converged(HEAL_TIMEOUT).await {
                 violations.push(err);
             }
-            violations.extend(verify(&addrs, &logs).await);
+            violations.extend(verify(&Arc::new(cluster.addrs()), &logs).await);
         }
         None => violations.push(format!(
             "cluster not writable {}s after every member came back",
@@ -127,17 +151,20 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
     std::fs::write(dir.join("chaos.timeline"), cluster.timeline.join("\n")).unwrap();
 
     let ids: Vec<u64> = cluster.members.iter().map(|m| m.id).collect();
-    let (agreed, log_violations) = check_logs(&dir, &ids);
+    let retired: Vec<u64> = cluster.retired.iter().map(|m| m.id).collect();
+    let everyone: Vec<u64> = ids.iter().chain(&retired).copied().collect();
+    let (agreed, log_violations) = check_logs(&dir, &ids, &retired);
     violations.extend(log_violations);
-    let terms = leaders_by_term(&dir, &ids);
+    let terms = leaders_by_term(&dir, &everyone);
     for (term, leaders) in &terms {
         if leaders.len() > 1 {
             violations.push(format!("term {term} had leaders {leaders:?}"));
         }
     }
 
-    let journals = journal_counts(&dir, &ids);
+    let journals = journal_counts(&dir, &everyone);
     let summary = report(&logs, &faults, chaos_elapsed, recovery, agreed, &terms, &journals);
+    eprintln!("chaos: {} members at the end", ids.len());
     if let Ok(path) = std::env::var("CHAOS_SUMMARY") {
         let mut summary = summary;
         summary["label"] = json!(std::env::var("CHAOS_LABEL").unwrap_or_default());
@@ -145,6 +172,10 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
         summary["max_down"] = json!(settings.max_down);
         summary["clients"] = json!(settings.clients);
         summary["nodes"] = json!(settings.nodes);
+        summary["min_nodes"] = json!(settings.min_nodes);
+        summary["max_nodes"] = json!(settings.max_nodes);
+        summary["membership_chance"] = json!(settings.membership_chance);
+        summary["final_nodes"] = json!(ids.len());
         summary["snapshot_every"] = json!(settings.snapshot_every);
         summary["snapshot_chunk"] = json!(settings.snapshot_chunk);
         summary["agreed_entries"] = json!(agreed);
@@ -186,8 +217,13 @@ async fn turbulent_cluster_keeps_acknowledged_writes() {
 struct Settings {
     secs: u64,
     nodes: u64,
+    min_nodes: usize,
+    max_nodes: usize,
+    /// Chance per tick of a member joining or leaving.
+    membership_chance: f64,
     clients: u64,
-    max_down: usize,
+    /// Members out at once; `None` keeps a majority of the known voters up.
+    max_down: Option<usize>,
     snapshot_every: usize,
     snapshot_chunk: usize,
     seed: u64,
@@ -198,12 +234,21 @@ impl Settings {
     fn from_env() -> Self {
         let nodes: u64 = env_or("CHAOS_NODES", 5);
         assert!(nodes >= 1, "CHAOS_NODES must be at least 1");
+        let min_nodes = env_or("CHAOS_MIN_NODES", 3.min(nodes as usize));
+        let max_nodes = env_or("CHAOS_MAX_NODES", nodes as usize + 2);
+        assert!(
+            1 <= min_nodes && min_nodes as u64 <= nodes && nodes <= max_nodes as u64,
+            "need 1 <= CHAOS_MIN_NODES ({min_nodes}) <= CHAOS_NODES ({nodes}) <= CHAOS_MAX_NODES ({max_nodes})"
+        );
         let clock = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
         Self {
             secs: env_or("CHAOS_SECS", 30),
             nodes,
+            min_nodes,
+            max_nodes,
+            membership_chance: env_or("CHAOS_MEMBERSHIP_CHANCE", 0.01),
             clients: env_or("CHAOS_CLIENTS", 8),
-            max_down: env_or("CHAOS_MAX_DOWN", ((nodes - 1) / 2) as usize),
+            max_down: std::env::var("CHAOS_MAX_DOWN").is_ok().then(|| env_or("CHAOS_MAX_DOWN", 0)),
             snapshot_every: env_or("CHAOS_SNAPSHOT_EVERY", 500),
             snapshot_chunk: env_or("CHAOS_SNAPSHOT_CHUNK", 4096),
             seed: env_or("CHAOS_SEED", clock % 1_000_000_000),
@@ -322,13 +367,19 @@ struct Member {
     /// Stable 1-based label for the timeline and log file names.
     n: usize,
     /// Raft id, picked at random by the member on first start and learned
-    /// from `GET /cluster/id`; 0 until then.
+    /// from `GET /cluster/id` or a membership view; 0 until then.
     id: u64,
     addr: String,
     child: Option<Child>,
     state: State,
     /// When a frozen or downed member is brought back.
     back_at: Instant,
+    /// Started with `--join` rather than as a bootstrap member.
+    joiner: bool,
+    /// For a joiner, the member it last asked to admit it.
+    seed: Option<String>,
+    /// Seen as a voter in a committed configuration.
+    voter: bool,
 }
 
 #[derive(Default)]
@@ -336,6 +387,9 @@ struct Faults {
     kills: u64,
     freezes: u64,
     aimed_at_leader: u64,
+    joins: u64,
+    removals: u64,
+    removed_leader: u64,
     /// When each fault was injected, from the start of the chaos phase.
     at: Vec<Duration>,
 }
@@ -343,9 +397,20 @@ struct Faults {
 struct Cluster {
     dir: PathBuf,
     members: Vec<Member>,
+    /// Members whose removal the cluster acknowledged; they are stopped.
+    retired: Vec<Member>,
+    /// Addresses of the bootstrap members, passed as `--peer`.
+    bootstrap: Vec<String>,
+    addrs: Addrs,
+    next_n: usize,
+    /// The member being removed, by label, and the task asking the cluster
+    /// to remove it. One at a time, as the cluster changes membership.
+    leaving: Option<(usize, tokio::task::JoinHandle<Result<(), String>>)>,
     started: Instant,
     timeline: Vec<String>,
-    unexpected_exits: Vec<String>,
+    /// Problems seen while running: members exiting on their own, removals
+    /// that failed.
+    violations: Vec<String>,
     snapshot_every: usize,
     snapshot_chunk: usize,
 }
@@ -366,15 +431,24 @@ impl Cluster {
                 child: None,
                 state: State::Down,
                 back_at: Instant::now(),
+                joiner: false,
+                seed: None,
+                voter: true,
             })
             .collect();
         drop(listeners);
+        let bootstrap: Vec<String> = members.iter().map(|m| m.addr.clone()).collect();
         let mut cluster = Self {
             dir: dir.to_path_buf(),
+            next_n: members.len() + 1,
             members,
+            retired: Vec::new(),
+            addrs: Arc::new(RwLock::new(bootstrap.clone())),
+            bootstrap,
+            leaving: None,
             started: Instant::now(),
             timeline: Vec::new(),
-            unexpected_exits: Vec::new(),
+            violations: Vec::new(),
             snapshot_every: settings.snapshot_every,
             snapshot_chunk: settings.snapshot_chunk,
         };
@@ -384,12 +458,17 @@ impl Cluster {
         cluster
     }
 
+    fn addrs(&self) -> Vec<String> {
+        self.addrs.read().unwrap().clone()
+    }
+
     fn note(&mut self, text: String) {
         let line = format!("{:>9.3}s {text}", self.started.elapsed().as_secs_f64());
         self.timeline.push(line);
     }
 
     fn spawn(&mut self, index: usize) {
+        let seed = self.members[index].joiner.then(|| self.pick_seed(index));
         let member = &self.members[index];
         let log = std::fs::OpenOptions::new()
             .create(true)
@@ -406,8 +485,13 @@ impl Cluster {
             .arg(self.snapshot_every.to_string())
             .arg("--snapshot-chunk")
             .arg(self.snapshot_chunk.to_string());
-        for peer in self.members.iter().filter(|m| m.n != member.n) {
-            command.arg("--peer").arg(&peer.addr);
+        // A joiner asks again on every start; the cluster ignores a repeat.
+        if let Some(seed) = &seed {
+            command.arg("--join").arg(seed);
+        } else {
+            for peer in self.bootstrap.iter().filter(|addr| **addr != member.addr) {
+                command.arg("--peer").arg(peer);
+            }
         }
         // The tracing subscriber writes to stdout, so capture both streams.
         let child = command
@@ -418,11 +502,57 @@ impl Cluster {
             .kill_on_drop(true)
             .spawn()
             .expect("failed to start member");
-        let n = member.n;
+        let via = seed
+            .as_ref()
+            .and_then(|seed| self.members.iter().find(|m| m.addr == *seed))
+            .map(|m| format!(" joining via node {}", m.n))
+            .unwrap_or_default();
         let member = &mut self.members[index];
         member.child = Some(child);
         member.state = State::Up;
-        self.note(format!("start  node {n}"));
+        member.seed = seed;
+        let n = member.n;
+        self.note(format!("start  node {n}{via}"));
+    }
+
+    /// A member for joiner `index` to ask: preferably a live voter that is
+    /// not leaving, as one that is still joining itself cannot admit others.
+    fn pick_seed(&self, index: usize) -> String {
+        let leaving = self.leaving_n();
+        let others = || self.members.iter().enumerate().filter(|(i, _)| *i != index).map(|(_, m)| m);
+        others()
+            .find(|m| m.state == State::Up && m.voter && Some(m.n) != leaving)
+            .or_else(|| others().find(|m| m.state == State::Up))
+            .or_else(|| others().next())
+            .map(|m| m.addr.clone())
+            .expect("a joiner needs another member to ask")
+    }
+
+    fn leaving_n(&self) -> Option<usize> {
+        self.leaving.as_ref().map(|(n, _)| *n)
+    }
+
+    /// Start a new member that joins the running cluster.
+    fn join(&mut self) {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .to_string();
+        self.members.push(Member {
+            n: self.next_n,
+            id: 0,
+            addr: addr.clone(),
+            child: None,
+            state: State::Down,
+            back_at: Instant::now(),
+            joiner: true,
+            seed: None,
+            voter: false,
+        });
+        self.next_n += 1;
+        self.addrs.write().unwrap().push(addr);
+        self.spawn(self.members.len() - 1);
     }
 
     async fn crash(&mut self, index: usize, outage: Duration) {
@@ -460,6 +590,30 @@ impl Cluster {
         }
     }
 
+    /// Stop a member whose removal was acknowledged and stop handing its
+    /// address to clients. It keeps its files for the final checks.
+    async fn retire(&mut self, index: usize) {
+        let mut member = self.members.remove(index);
+        if member.state == State::Frozen {
+            signal(member.child.as_ref(), "CONT");
+        }
+        // Gracefully, so its journal reaches disk; stop_all waits for it.
+        signal(member.child.as_ref(), "INT");
+        member.state = State::Down;
+        self.addrs.write().unwrap().retain(|addr| *addr != member.addr);
+        self.note(format!("retire node {} (id {})", member.n, member.id));
+        // A joiner retries the member it was told to ask, so one still
+        // asking this member would never get in; restart it to pick another.
+        let stranded: Vec<usize> = (0..self.members.len())
+            .filter(|&i| !self.members[i].voter && self.members[i].seed.as_deref() == Some(member.addr.as_str()))
+            .collect();
+        self.retired.push(member);
+        for index in stranded {
+            self.crash(index, Duration::ZERO).await;
+            self.revive(index);
+        }
+    }
+
     /// A member that exits without being told to has crashed on its own.
     fn reap(&mut self) {
         for index in 0..self.members.len() {
@@ -473,7 +627,7 @@ impl Cluster {
                 member.back_at = Instant::now() + Duration::from_millis(500);
                 let text = format!("node {} exited on its own ({status}); see node{}.log", member.n, member.n);
                 self.note(text.clone());
-                self.unexpected_exits.push(text);
+                self.violations.push(text);
             }
         }
     }
@@ -515,32 +669,84 @@ impl Cluster {
         changed
     }
 
-    /// The leader according to the first live member that answers.
-    async fn leader(&self) -> Option<usize> {
+    /// The membership as the first live member that answers sees it.
+    async fn view(&self) -> Option<Value> {
         for member in self.members.iter().filter(|m| m.state == State::Up) {
             if let Reply::Status(200, body) = http(&member.addr, "GET", "/cluster/members", None, PROBE_TIMEOUT).await {
-                let leader = json_of(&body)["leader"].as_u64();
-                return self.members.iter().position(|m| Some(m.id) == leader);
+                return Some(json_of(&body));
             }
         }
         None
     }
 
-    /// Inject faults until the configured duration is up.
+    /// Mark members that a committed configuration lists as voters, and
+    /// learn their ids.
+    fn observe(&mut self, view: &Value) {
+        if view["committed"] != true {
+            return;
+        }
+        for (id, addr) in voters(view) {
+            if let Some(member) = self.members.iter_mut().find(|m| m.addr == addr) {
+                member.voter = true;
+                member.id = id;
+            }
+        }
+    }
+
+    /// The member a view names as leader.
+    fn leader_in(&self, view: &Value) -> Option<usize> {
+        let leader = view["leader"].as_u64()?;
+        let (_, addr) = voters(view).into_iter().find(|(id, _)| *id == leader)?;
+        self.members.iter().position(|m| m.addr == addr)
+    }
+
+    /// The leader according to the first live member that answers.
+    async fn leader(&self) -> Option<usize> {
+        self.view().await.and_then(|view| self.leader_in(&view))
+    }
+
+    /// How many members may be out at once. Unless set, a majority of the
+    /// voters known for certain, less `excluding`, stays up. The cluster may
+    /// have more voters than known (a joiner promoted since the last look),
+    /// which only makes this stricter than needed.
+    fn down_cap(&self, settings: &Settings, excluding: Option<usize>) -> usize {
+        if let Some(cap) = settings.max_down {
+            return cap;
+        }
+        let leaving = self.leaving_n();
+        let voters = (0..self.members.len())
+            .filter(|&i| self.members[i].voter && Some(self.members[i].n) != leaving && Some(i) != excluding)
+            .count();
+        voters.saturating_sub(1) / 2
+    }
+
+    /// Inject faults and membership changes until the configured duration is
+    /// up.
     async fn rampage(&mut self, settings: &Settings, rng: &mut Rng, origin: Instant) -> Faults {
         let mut faults = Faults::default();
         let deadline = Instant::now() + Duration::from_secs(settings.secs);
         let mut next_fault = Instant::now() + rng.millis(100, 1200);
+        let mut next_observe = Instant::now();
         while Instant::now() < deadline {
             self.reap();
+            self.settle_removal().await;
             let now = Instant::now();
             for index in 0..self.members.len() {
                 if self.members[index].state != State::Up && self.members[index].back_at <= now {
                     self.revive(index);
                 }
             }
+            if now >= next_observe && self.members.iter().any(|m| !m.voter) {
+                next_observe = now + OBSERVE_EVERY;
+                if let Some(view) = self.view().await {
+                    self.observe(&view);
+                }
+            }
+            if rng.chance(settings.membership_chance) {
+                self.change_membership(settings, rng, &mut faults).await;
+            }
             let out = self.members.iter().filter(|m| m.state != State::Up).count();
-            if now >= next_fault && out < settings.max_down {
+            if now >= next_fault && out < self.down_cap(settings, None) {
                 next_fault = now + rng.millis(100, 1200);
                 let mut target = None;
                 if rng.chance(LEADER_BIAS) {
@@ -572,6 +778,98 @@ impl Cluster {
         faults
     }
 
+    /// Add a member or start removing one, whichever keeps the member count
+    /// within bounds. A member being removed still counts until the cluster
+    /// acknowledges its removal.
+    async fn change_membership(&mut self, settings: &Settings, rng: &mut Rng, faults: &mut Faults) {
+        let size = self.members.len();
+        let can_add = size < settings.max_nodes;
+        let can_remove = size > settings.min_nodes && self.leaving.is_none();
+        if can_add && (!can_remove || rng.chance(0.5)) {
+            faults.joins += 1;
+            self.join();
+            return;
+        }
+        if !can_remove {
+            return;
+        }
+        let Some(view) = self.view().await else {
+            return;
+        };
+        self.observe(&view);
+        // Only voters: a joiner still catching up may yet be re-added by its
+        // own retried request. The last voter cannot be removed.
+        let voters = voters(&view);
+        if voters.len() < 2 {
+            return;
+        }
+        let candidates: Vec<usize> = (0..self.members.len())
+            .filter(|&i| voters.iter().any(|(_, addr)| *addr == self.members[i].addr))
+            .collect();
+        let leader = self.leader_in(&view).filter(|i| candidates.contains(i));
+        let target = match leader {
+            Some(leader) if rng.chance(LEADER_BIAS) => leader,
+            _ => match candidates.get(rng.below(candidates.len().max(1))) {
+                Some(&target) => target,
+                None => return,
+            },
+        };
+        // Removing an up voter must not leave too many of the rest out.
+        let out = (0..self.members.len())
+            .filter(|&i| i != target && self.members[i].state != State::Up)
+            .count();
+        if out > self.down_cap(settings, Some(target)) {
+            return;
+        }
+        faults.removals += 1;
+        faults.removed_leader += (Some(target) == leader) as u64;
+        let member = &self.members[target];
+        let (n, id) = (member.n, member.id);
+        let leading = if Some(target) == leader { " (leader)" } else { "" };
+        self.note(format!("remove node {n} (id {id}){leading}"));
+        let task = tokio::spawn(remove_member(id, Arc::clone(&self.addrs)));
+        self.leaving = Some((n, task));
+    }
+
+    /// Retire the leaving member once the cluster has acknowledged its
+    /// removal.
+    async fn settle_removal(&mut self) {
+        if self.leaving.as_ref().is_some_and(|(_, task)| task.is_finished()) {
+            let (n, task) = self.leaving.take().unwrap();
+            self.removed(n, task.await.unwrap()).await;
+        }
+    }
+
+    /// After healing, wait for a removal still in progress.
+    async fn finish_removal(&mut self, limit: Duration) {
+        let Some((n, mut task)) = self.leaving.take() else {
+            return;
+        };
+        match tokio::time::timeout(limit, &mut task).await {
+            Ok(result) => self.removed(n, result.unwrap()).await,
+            Err(_) => {
+                task.abort();
+                self.violations.push(format!(
+                    "removing node {n} was not acknowledged {}s after healing",
+                    limit.as_secs()
+                ));
+            }
+        }
+    }
+
+    async fn removed(&mut self, n: usize, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                let index = self.members.iter().position(|m| m.n == n).unwrap();
+                self.retire(index).await;
+            }
+            Err(err) => {
+                self.note(format!("remove node {n} failed: {err}"));
+                self.violations.push(format!("node {n}: {err}"));
+            }
+        }
+    }
+
     async fn heal(&mut self) {
         self.reap();
         for index in 0..self.members.len() {
@@ -580,10 +878,11 @@ impl Cluster {
     }
 
     /// Write a marker until one is acknowledged; returns how long that took.
-    async fn wait_writable(&self, addrs: &[String], limit: Duration) -> Option<Duration> {
+    async fn wait_writable(&self, limit: Duration) -> Option<Duration> {
         let started = Instant::now();
         let mut attempt = 0;
         while started.elapsed() < limit {
+            let addrs = self.addrs();
             let addr = &addrs[attempt % addrs.len()];
             attempt += 1;
             let marker = json!({ "attempt": attempt });
@@ -593,6 +892,50 @@ impl Cluster {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         None
+    }
+
+    /// Wait for the leader's committed configuration to hold exactly the
+    /// current members, all promoted to voters.
+    async fn wait_membership(&mut self, limit: Duration) -> Result<(), String> {
+        let started = Instant::now();
+        let want: BTreeSet<u64> = self.members.iter().map(|m| m.id).collect();
+        let retired: BTreeSet<u64> = self.retired.iter().map(|m| m.id).collect();
+        let mut seen = None;
+        loop {
+            for member in &self.members {
+                let Reply::Status(200, body) = http(&member.addr, "GET", "/cluster/members", None, PROBE_TIMEOUT).await
+                else {
+                    continue;
+                };
+                let view = json_of(&body);
+                if view["id"] != view["leader"] {
+                    continue;
+                }
+                let ids = |list: &str| -> BTreeSet<u64> {
+                    view[list].as_array().into_iter().flatten().filter_map(|p| p["id"].as_u64()).collect()
+                };
+                let (voters, learners) = (ids("voters"), ids("learners"));
+                if voters == want && learners.is_empty() && view["committed"] == true {
+                    return Ok(());
+                }
+                // A joiner's retried request can re-add it as a learner just
+                // after it was removed and stopped. Not a fault in the
+                // cluster; drop it again so the check can finish.
+                for &id in learners.intersection(&retired) {
+                    let _ = http(&member.addr, "DELETE", &format!("/cluster/members/{id}"), None, CLIENT_TIMEOUT).await;
+                }
+                seen = Some(format!("voters {voters:?}, learners {learners:?}"));
+                break;
+            }
+            if started.elapsed() > limit {
+                return Err(format!(
+                    "configuration never held exactly the members {want:?} as voters (removed: {retired:?}); \
+                     the leader last had {}",
+                    seen.unwrap_or_else(|| "no leader found".into())
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Wait for every member to apply the same log and hold the same keys.
@@ -629,7 +972,8 @@ impl Cluster {
             }
             signal(member.child.as_ref(), "INT");
         }
-        for member in &mut self.members {
+        // Retired members were told to stop when they were retired.
+        for member in self.members.iter_mut().chain(&mut self.retired) {
             if let Some(mut child) = member.child.take() {
                 if tokio::time::timeout(STOP_TIMEOUT, child.wait()).await.is_err() {
                     let _ = child.start_kill();
@@ -639,6 +983,36 @@ impl Cluster {
             member.state = State::Down;
         }
     }
+}
+
+/// Voters in a membership view, as (id, address).
+fn voters(view: &Value) -> Vec<(u64, String)> {
+    view["voters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|peer| Some((peer["id"].as_u64()?, peer["addr"].as_str()?.to_string())))
+        .collect()
+}
+
+/// Ask the cluster through its current members to remove `id` until one
+/// acknowledges. Removal is idempotent, so a lost reply is simply retried.
+async fn remove_member(id: u64, addrs: Addrs) -> Result<(), String> {
+    let path = format!("/cluster/members/{id}");
+    for attempt in 0.. {
+        let addr = {
+            let addrs = addrs.read().unwrap();
+            addrs[attempt % addrs.len()].clone()
+        };
+        match http(&addr, "DELETE", &path, None, CLIENT_TIMEOUT).await {
+            Reply::Status(200, _) => return Ok(()),
+            Reply::Status(409, body) => {
+                return Err(format!("removal rejected: {}", String::from_utf8_lossy(&body)));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    unreachable!()
 }
 
 fn signal(child: Option<&Child>, name: &str) {
@@ -683,7 +1057,7 @@ impl ClientLog {
 /// Each client owns keys `u{id}-{seq}` (written once) and a register
 /// `r{id}` (overwritten with rising seq), so every check is per client and
 /// needs no coordination between clients.
-async fn client(id: u64, addrs: Arc<Vec<String>>, seed: u64, stop: Arc<AtomicBool>, origin: Instant) -> ClientLog {
+async fn client(id: u64, addrs: Addrs, seed: u64, stop: Arc<AtomicBool>, origin: Instant) -> ClientLog {
     let mut rng = Rng::new(seed);
     let mut log = ClientLog {
         id,
@@ -699,11 +1073,14 @@ async fn client(id: u64, addrs: Arc<Vec<String>>, seed: u64, stop: Arc<AtomicBoo
     let mut seq = 0u64;
     let mut burst = 0u64;
     while !stop.load(Ordering::Relaxed) {
-        let addr = &addrs[rng.below(addrs.len())];
+        let addr = {
+            let addrs = addrs.read().unwrap();
+            addrs[rng.below(addrs.len())].clone()
+        };
         let roll = rng.below(100);
         if roll < 10 {
             let floor = log.register;
-            let reply = http(addr, "GET", &register_path, None, CLIENT_TIMEOUT).await;
+            let reply = http(&addr, "GET", &register_path, None, CLIENT_TIMEOUT).await;
             log.count("GET", &reply);
             match reply {
                 Reply::Status(200, body) => {
@@ -728,7 +1105,7 @@ async fn client(id: u64, addrs: Arc<Vec<String>>, seed: u64, stop: Arc<AtomicBoo
             let path = if register { register_path.clone() } else { format!("/u{id}-{seq}") };
             let value = json!({ "client": id, "seq": seq });
             let sent = Instant::now();
-            let reply = http(addr, "PUT", &path, Some(&value), CLIENT_TIMEOUT).await;
+            let reply = http(&addr, "PUT", &path, Some(&value), CLIENT_TIMEOUT).await;
             log.count("PUT", &reply);
             match reply {
                 Reply::Status(201, _) => log.acked_at.push((sent - origin, sent.elapsed())),
@@ -812,68 +1189,78 @@ async fn verify(addrs: &Arc<Vec<String>>, logs: &[ClientLog]) -> Vec<String> {
     violations
 }
 
-/// Compare persisted logs up to the lowest commit index any member saved,
-/// over the entries each pair still holds. Returns that index and any
-/// divergence found.
-fn check_logs(dir: &Path, ids: &[u64]) -> (usize, Vec<String>) {
-    let mut states = Vec::new();
-    for id in ids {
-        let path = dir.join(format!("{id}.json"));
-        match std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) {
-            Some(state) => states.push((*id, state)),
-            None => return (0, vec![format!("node {id} left no readable state at {}", path.display())]),
-        }
-    }
+/// A member's persisted log: its id, commit index, base and entries.
+struct SavedLog {
+    id: u64,
+    commit: usize,
+    base: usize,
+    entries: Vec<Value>,
+}
+
+fn load_log(dir: &Path, id: u64) -> Result<SavedLog, String> {
+    let path = dir.join(format!("{id}.json"));
+    let Some(state) = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) else {
+        return Err(format!("node {id} left no readable state at {}", path.display()));
+    };
     // The commit index is in ID.commit.json, or in ID.json in older versions.
-    let commit = states
-        .iter()
-        .map(|(id, state)| {
-            std::fs::read(dir.join(format!("{id}.commit.json")))
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .and_then(|saved| saved["commit_index"].as_u64())
-                .or_else(|| state["commit_index"].as_u64())
-                .unwrap_or(0) as usize
-        })
-        .min()
-        .unwrap_or(0);
+    let commit = std::fs::read(dir.join(format!("{id}.commit.json")))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|saved| saved["commit_index"].as_u64())
+        .or_else(|| state["commit_index"].as_u64())
+        .unwrap_or(0) as usize;
     // The log is in ID.log.jsonl, one entry per line (a line torn by a kill
     // ends it), or inside ID.json in older versions. The first line stands for
     // the entry at the log's base: the "base" it carries after compaction,
     // else the sentinel entry 0. Line i is entry base + i.
-    let logs: Vec<(u64, usize, Vec<Value>)> = states
-        .iter()
-        .map(|(id, state)| {
-            let log: Vec<Value> = match state["log"].as_array() {
-                Some(log) => log.clone(),
-                None => std::fs::read_to_string(dir.join(format!("{id}.log.jsonl")))
-                    .unwrap_or_default()
-                    .lines()
-                    .map_while(|line| serde_json::from_str(line).ok())
-                    .collect(),
-            };
-            let base = log.first().and_then(|first| first["base"].as_u64()).unwrap_or(0) as usize;
-            (*id, base, log)
-        })
-        .collect();
+    let entries: Vec<Value> = match state["log"].as_array() {
+        Some(log) => log.clone(),
+        None => std::fs::read_to_string(dir.join(format!("{id}.log.jsonl")))
+            .unwrap_or_default()
+            .lines()
+            .map_while(|line| serde_json::from_str(line).ok())
+            .collect(),
+    };
+    let base = entries.first().and_then(|first| first["base"].as_u64()).unwrap_or(0) as usize;
+    Ok(SavedLog { id, commit, base, entries })
+}
+
+/// Compare persisted logs up to the lowest commit index any member saved,
+/// over the entries each pair still holds. A removed member stopped
+/// receiving entries when it left, so it is compared up to its own commit
+/// index. Returns the members' common commit index and any divergence found.
+fn check_logs(dir: &Path, ids: &[u64], retired: &[u64]) -> (usize, Vec<String>) {
+    let load = |ids: &[u64]| ids.iter().map(|&id| load_log(dir, id)).collect::<Result<Vec<_>, _>>();
+    let (logs, gone) = match (load(ids), load(retired)) {
+        (Ok(logs), Ok(gone)) => (logs, gone),
+        (Err(err), _) | (_, Err(err)) => return (0, vec![err]),
+    };
+    let commit = logs.iter().map(|log| log.commit).min().unwrap_or(0);
     let mut violations = Vec::new();
-    let (first_id, first_base, first) = &logs[0];
-    for (id, base, log) in &logs[1..] {
-        if base + log.len() <= commit || first_base + first.len() <= commit {
-            violations.push(format!("node {id} or {first_id} saved fewer than {commit} committed entries"));
-            continue;
-        }
-        // Entries at or below either base are compacted into a snapshot.
-        let from = (*base).max(*first_base) + 1;
-        if let Some(index) = (from..=commit).find(|&i| log[i - base] != first[i - first_base]) {
-            violations.push(format!(
-                "committed entry {index} differs: node {first_id} has {}, node {id} has {}",
-                first[index - first_base],
-                log[index - base]
-            ));
-        }
+    let first = &logs[0];
+    for other in &logs[1..] {
+        violations.extend(compare_logs(first, other, commit));
+    }
+    for other in &gone {
+        violations.extend(compare_logs(first, other, commit.min(other.commit)));
     }
     (commit, violations)
+}
+
+fn compare_logs(first: &SavedLog, other: &SavedLog, commit: usize) -> Option<String> {
+    let (first_id, first_base, first) = (first.id, first.base, &first.entries);
+    let (id, base, log) = (other.id, other.base, &other.entries);
+    if base + log.len() <= commit || first_base + first.len() <= commit {
+        return Some(format!("node {id} or {first_id} saved fewer than {commit} committed entries"));
+    }
+    // Entries at or below either base are compacted into a snapshot.
+    let from = base.max(first_base) + 1;
+    let index = (from..=commit).find(|&i| log[i - base] != first[i - first_base])?;
+    Some(format!(
+        "committed entry {index} differs: node {first_id} has {}, node {id} has {}",
+        first[index - first_base],
+        log[index - base]
+    ))
 }
 
 /// Counts of selected journal events across members, keyed like
@@ -935,6 +1322,10 @@ fn report(
         faults.kills, faults.freezes, faults.aimed_at_leader
     );
     eprintln!(
+        "chaos: membership: {} joins, {} removals ({} of the leader)",
+        faults.joins, faults.removals, faults.removed_leader
+    );
+    eprintln!(
         "chaos: writes: {writes} attempted, {acked} acknowledged ({:.0}%), {:.0}/s acknowledged",
         100.0 * acked as f64 / writes.max(1) as f64,
         acked as f64 / secs
@@ -967,6 +1358,9 @@ fn report(
         "secs": secs,
         "kills": faults.kills,
         "freezes": faults.freezes,
+        "joins": faults.joins,
+        "removals": faults.removals,
+        "removed_leader": faults.removed_leader,
         "writes": writes,
         "acked": acked,
         "acked_per_s": acked as f64 / secs,
